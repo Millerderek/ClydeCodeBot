@@ -2,7 +2,7 @@
 
 **Telegram → Claude Agent SDK Bridge**
 
-A single-file bot (~1800 LOC) that turns Telegram messages into Claude Code CLI work. Instead of building a new agent platform, ClaudeClaw gives you **mobile remote-control for your existing Claude Code workspace** — same CLAUDE.md, same skills, same MCP servers, same local files.
+A single-file bot (~2000 LOC) that turns Telegram messages into Claude Code CLI work. Instead of building a new agent platform, ClaudeClaw gives you **mobile remote-control for your existing Claude Code workspace** — same CLAUDE.md, same skills, same MCP servers, same local files.
 
 Uses **Claude Code OAuth** (Pro/Max subscription) by default. No API key required.
 
@@ -31,49 +31,99 @@ If you already live inside Claude Code, you're duplicating effort by building:
 
 ClaudeClaw just bridges mobile access to that environment. Improvements apply everywhere.
 
-## Quick Start
+---
 
-### 1. Prerequisites
+## Install
 
-- Python 3.10+
-- Node.js 18+ (for Claude Code CLI)
-- A Telegram account
-
-### 2. Create Your Telegram Bot
-
-1. Message [@BotFather](https://t.me/BotFather) → `/newbot`
-2. Copy the bot token
-
-### 3. Get Your Telegram User ID
-
-Message [@userinfobot](https://t.me/userinfobot) — it replies with your numeric ID.
-
-### 4. Authenticate Claude Code
+### Option A: One-Command Install (Linux/VPS)
 
 ```bash
-npm install -g @anthropic-ai/claude-code
-claude
-# Follow the prompts to authenticate via browser
+curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCode/main/install.sh | bash
 ```
 
-This creates an OAuth session that the SDK uses automatically. **No API key needed.**
+The interactive wizard walks you through everything:
+1. System dependencies (Python, Node.js, git, screen)
+2. Claude Code OAuth login
+3. Telegram bot creation (main + permission bot)
+4. User authentication (Telegram user IDs)
+5. Audit chain setup (pick AI reviewers from presets)
+6. ClawVault encrypted key storage
+7. Soul.md personality configuration
+8. Auto-generates `.env`, `deploy.sh`, and starts the bot
 
-### 5. Install & Run
+### Option B: Manual Install
 
 ```bash
-git clone https://github.com/yourusername/claudeclaw.git
-cd claudeclaw
+git clone https://github.com/Millerderek/ClydeCode.git ~/claudeclaw
+cd ~/claudeclaw
 pip install -r requirements.txt
-
 cp .env.example .env
 # Edit .env: set TELEGRAM_BOT_TOKEN and ALLOWED_USER_IDS
-
 python3 claudeclaw.py
 ```
 
-### 6. Message Your Bot
+### Option C: VPS Deploy from Windows (PowerShell)
 
-Open Telegram, find your bot, send any message.
+#### First Time: Passwordless SSH
+
+Run these once — after this, every command is password-free:
+
+```powershell
+# 1. Generate SSH key (skip if you already have one)
+if (!(Test-Path "$env:USERPROFILE\.ssh\id_rsa")) {
+    ssh-keygen -t rsa -N '""' -f "$env:USERPROFILE\.ssh\id_rsa"
+}
+
+# 2. Copy public key to VPS (this is the LAST time you type the password)
+type "$env:USERPROFILE\.ssh\id_rsa.pub" | ssh root@YOUR_VPS_IP "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+#### Install on VPS (from PowerShell, no password)
+
+```powershell
+ssh root@YOUR_VPS_IP "curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCode/main/install.sh | bash"
+```
+
+The wizard runs interactively over SSH. Done.
+
+#### Deploy Updates (from PowerShell, no password)
+
+```powershell
+# One-liner: upload new code and restart
+scp "$env:USERPROFILE\Downloads\claudeclaw.py" root@YOUR_VPS_IP:~/claudeclaw/claudeclaw.py; ssh root@YOUR_VPS_IP "~/claudeclaw/deploy.sh"
+
+# With auditor config
+scp "$env:USERPROFILE\Downloads\claudeclaw.py" root@YOUR_VPS_IP:~/claudeclaw/claudeclaw.py; scp "$env:USERPROFILE\Downloads\auditors.json" root@YOUR_VPS_IP:~/.claudeclaw/auditors.json; ssh root@YOUR_VPS_IP "~/claudeclaw/deploy.sh"
+```
+
+#### Check Logs (from PowerShell, no password)
+
+```powershell
+# Recent logs
+ssh root@YOUR_VPS_IP "tail -20 /tmp/claw.log"
+
+# Audit chain activity
+ssh root@YOUR_VPS_IP "grep 'Auto-approved\|audit chain\|Risk' /tmp/claw.log | tail -10"
+
+# Live tail
+ssh root@YOUR_VPS_IP "tail -f /tmp/claw.log"
+```
+
+---
+
+## Before You Install
+
+You'll need these ready (the installer will prompt for each):
+
+| What | Where to Get It |
+|------|----------------|
+| Telegram main bot token | [@BotFather](https://t.me/BotFather) → `/newbot` |
+| Telegram permission bot token | [@BotFather](https://t.me/BotFather) → `/newbot` (second bot) |
+| Your Telegram user ID | [@userinfobot](https://t.me/userinfobot) |
+| Claude Code login | `npm install -g @anthropic-ai/claude-code && claude` |
+| Auditor API key(s) | [OpenAI](https://platform.openai.com/api-keys), [Google AI](https://aistudio.google.com/apikey), etc. |
+
+---
 
 ## Authentication
 
@@ -82,16 +132,18 @@ Open Telegram, find your bot, send any message.
 | **Claude Code OAuth** (recommended) | Run `claude` and login once | Uses your Pro/Max subscription |
 | API Key | Set `ANTHROPIC_API_KEY` in `.env` | Pay-per-token via API |
 
+---
+
 ## Configuration
 
-All config via environment variables (or `.env` file):
+All config via environment variables (or `.env` file). The installer generates this automatically.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Main bot token from @BotFather |
 | `ALLOWED_USER_IDS` | ✅ | — | Comma-separated Telegram user IDs |
 | `ANTHROPIC_API_KEY` | — | — | Fallback if no OAuth session |
-| `PERMISSION_BOT_TOKEN` | — | — | Permission bot (setup wizard on first run) |
+| `PERMISSION_BOT_TOKEN` | — | — | Permission bot token |
 | `CLAUDECLAW_WORKING_DIR` | — | `~` | Workspace path |
 | `CLAUDECLAW_MODEL` | — | SDK default | Model override |
 | `CLAUDECLAW_PERMISSION_MODE` | — | `default` | `default` or `acceptEdits` |
@@ -105,6 +157,8 @@ All config via environment variables (or `.env` file):
 | `CLAUDECLAW_AUDITORS` | — | `~/.claudeclaw/auditors.json` | Path to auditors config |
 | `OPENCLAW_PATH` | — | — | OpenClaw memory directory |
 | `CRASHCART_PATH` | — | — | ClawCrashCart backup directory |
+
+---
 
 ## Bot Commands
 
@@ -120,6 +174,11 @@ All config via environment variables (or `.env` file):
 | `/approve` | Add a standing approval |
 | `/revoke` | Remove a standing approval |
 | `/auditors` | View audit chain config |
+| `/addauditor` | Add a new auditor (presets or custom) |
+| `/removeauditor` | Remove an auditor |
+| `/toggleauditor` | Enable/disable an auditor |
+
+---
 
 ## Security
 
@@ -180,12 +239,12 @@ Supported providers:
 - `google` — Gemini API
 - `kimi` — Moonshot API
 
-Config is auto-saved to `~/.claudeclaw/auditors.json` and persists across restarts.
+Config auto-saves to `~/.claudeclaw/auditors.json` and persists across restarts.
 
-### API Key Resolution
+### API Key Resolution (ClawVault)
 
 Keys are resolved in order:
-1. **ClawVault** — Encrypted vault at `/etc/openclaw/` (recommended)
+1. **ClawVault** — Encrypted vault at `/etc/openclaw/` (set up by installer)
 2. **Environment variables** — `OPENAI_API_KEY`, `GOOGLE_API_KEY`, etc.
 3. **Manual paste** — Interactive prompt at startup
 
@@ -224,6 +283,8 @@ Standing approvals persist in `~/.claudeclaw/standing_approvals.json`.
 - Workspace scoping via `CLAUDECLAW_WORKING_DIR`
 - Telegram is NOT e2e encrypted — don't send secrets
 
+---
+
 ## OpenClaw Memory Integration
 
 Load [OpenClaw](https://github.com/openclawai/openclaw) memory files as system prompt context:
@@ -238,6 +299,8 @@ Load [OpenClaw](https://github.com/openclawai/openclaw) memory files as system p
 | `memory/YYYY-MM-DD.md` | Today's daily log |
 
 Set `OPENCLAW_PATH` or `CRASHCART_PATH`.
+
+---
 
 ## Docker
 
@@ -256,6 +319,8 @@ cd memory && bash setup.sh
 
 Bundled tools: `openclaw-memo`, `openclaw-custodian`, `clawcrashcart` — all auto-approved.
 
+---
+
 ## How It Works
 
 1. Telegram polling (no inbound ports)
@@ -270,64 +335,3 @@ Bundled tools: `openclaw-memo`, `openclaw-custodian`, `clawcrashcart` — all au
 ## License
 
 MIT
-
-## VPS Deployment
-
-### Passwordless SSH Setup (PowerShell)
-
-```powershell
-# Generate SSH key (skip if you already have one)
-ssh-keygen -t rsa -N '""' -f "$env:USERPROFILE\.ssh\id_rsa"
-
-# Copy public key to VPS
-type "$env:USERPROFILE\.ssh\id_rsa.pub" | ssh root@YOUR_VPS_IP "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-```
-
-### Deploy Script
-
-Create `~/claudeclaw/deploy.sh` on your VPS:
-
-```bash
-#!/bin/bash
-echo "🔪 Stopping old process..."
-screen -ls | grep claw && screen -S claw -X quit 2>/dev/null
-sleep 1
-
-echo "📦 Installing dependencies..."
-cd ~/claudeclaw
-pip install -r requirements.txt -q --break-system-packages 2>/dev/null
-
-echo "🚀 Starting ClaudeClaw..."
-> /tmp/claw.log
-screen -dmS claw bash -c "cd ~/claudeclaw && python3 claudeclaw.py 2>&1 | tee /tmp/claw.log"
-sleep 2
-
-echo "═══ Startup Log ═══"
-cat /tmp/claw.log
-echo ""
-echo "═══ Status ═══"
-screen -ls | grep claw && echo "✅ ClaudeClaw running (PID: $(pgrep -f claudeclaw.py))" || echo "❌ Failed to start"
-```
-
-```bash
-chmod +x ~/claudeclaw/deploy.sh
-```
-
-### One-Liner Deploy (PowerShell)
-
-```powershell
-scp "$env:USERPROFILE\Downloads\claudeclaw.py" root@YOUR_VPS_IP:~/claudeclaw/claudeclaw.py; ssh root@YOUR_VPS_IP "~/claudeclaw/deploy.sh"
-```
-
-### Deploy with Auditor Config
-
-```powershell
-scp "$env:USERPROFILE\Downloads\claudeclaw.py" root@YOUR_VPS_IP:~/claudeclaw/claudeclaw.py; scp "$env:USERPROFILE\Downloads\auditors.json" root@YOUR_VPS_IP:~/.claudeclaw/auditors.json; ssh root@YOUR_VPS_IP "~/claudeclaw/deploy.sh"
-```
-
-### Check Logs
-
-```powershell
-ssh root@YOUR_VPS_IP "tail -20 /tmp/claw.log"
-ssh root@YOUR_VPS_IP "grep 'Auto-approved\|audit chain' /tmp/claw.log | tail -10"
-```
