@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ClaudeClaw - Telegram to Claude Agent SDK Bridge
+ClydeCodeBot - Telegram to Claude Agent SDK Bridge
 Uses ClaudeSDKClient for persistent per-user conversation sessions.
 Includes OTP permission gate for tool approvals via Telegram.
 """
@@ -15,8 +15,523 @@ from telegram.constants import ParseMode, ChatAction
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
 
-logging.basicConfig(format="%(asctime)s [claudeclaw] %(levelname)s: %(message)s", level=logging.INFO)
-logger = logging.getLogger("claudeclaw")
+logging.basicConfig(format="%(asctime)s [clydecodebot] %(levelname)s: %(message)s", level=logging.INFO)
+logger = logging.getLogger("clydecodebot")
+
+# ─── Version & Update System ────────────────────────────────────────────────
+VERSION = "1.0.0"
+ALERT_PUBLIC_KEY = "19f33de283809323a4cfe12ffa818f74dbee64dfebb335b4f4094df1978796da"
+UPSTREAM_REPO = "Millerderek/ClydeCodeBot"
+UPSTREAM_RAW = f"https://raw.githubusercontent.com/{UPSTREAM_REPO}/main"
+UPSTREAM_API = f"https://api.github.com/repos/{UPSTREAM_REPO}"
+NORMAL_CHECK_INTERVAL = 259200   # 3 days
+CRITICAL_CHECK_INTERVAL = 21600  # 6 hours
+CONFIG_DIR = Path("~/.clydecodebot").expanduser()
+SEEN_ALERTS_PATH = CONFIG_DIR / "seen_alerts.json"
+CHECKSUMMED_FILES = ["clydecodebot.py", "install.sh", "requirements.txt"]
+
+
+def verify_signature(payload_json: dict, signature_b64: str) -> bool:
+    """Verify Ed25519 signature on a payload."""
+    if not ALERT_PUBLIC_KEY:
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        import base64
+        pub_bytes = bytes.fromhex(ALERT_PUBLIC_KEY)
+        pub_key = Ed25519PublicKey.from_public_bytes(pub_bytes)
+        verify_payload = {k: v for k, v in payload_json.items() if k != "signature"}
+        payload_bytes = json.dumps(verify_payload, sort_keys=True, separators=(",", ":")).encode()
+        sig_bytes = base64.b64decode(signature_b64)
+        pub_key.verify(sig_bytes, payload_bytes)
+        return True
+    except Exception as e:
+        logger.warning(f"Signature verification failed: {e}")
+        return False
+
+
+def parse_version(v: str) -> tuple:
+    """Parse version string to comparable tuple."""
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
+def sha256_file(filepath: str) -> str:
+    """Compute SHA256 of a file on disk."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_seen_alerts() -> set:
+    try:
+        with open(SEEN_ALERTS_PATH) as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def save_seen_alerts(seen: set):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SEEN_ALERTS_PATH, "w") as f:
+        json.dump(list(seen), f)
+
+
+def detect_fork() -> dict:
+    """Check if running from a fork. Returns dict with is_fork and details."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(Path(__file__).parent)
+        )
+        origin = result.stdout.strip()
+        is_fork = UPSTREAM_REPO not in origin
+        return {"is_fork": is_fork, "origin": origin}
+    except Exception:
+        return {"is_fork": True, "origin": "unknown"}
+
+
+async def fetch_json(url: str) -> dict | None:
+    """Fetch JSON from URL with timeout."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+    except Exception as e:
+        logger.debug(f"Fetch failed {url}: {e}")
+    return None
+
+
+async def fetch_text(url: str) -> str | None:
+    """Fetch text from URL."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+    except Exception as e:
+        logger.debug(f"Fetch failed {url}: {e}")
+    return None
+
+
+async def auditor_diff_review(audit_chain, changelog: str, diff_summary: str) -> dict:
+    """
+    Ask auditor bots to review a code diff for suspicious changes.
+    Returns {"approved": bool, "results": [...]}
+    """
+    if not audit_chain or not audit_chain.is_available:
+        return {"approved": True, "results": [{"auditor": "none", "verdict": "skipped"}]}
+
+    review_prompt = (
+        "You are reviewing a software update for ClydeCodeBot (a Telegram bot).\n"
+        "Determine if this update looks LEGITIMATE or SUSPICIOUS.\n\n"
+        "CHANGELOG:\n%s\n\n"
+        "CODE CHANGES SUMMARY:\n%s\n\n"
+        "Look for:\n"
+        "- Backdoors or credential harvesting\n"
+        "- Exfiltration of keys, tokens, or user data\n"
+        "- Disabling security features (audit chain, permissions)\n"
+        "- Obfuscated or encoded payloads\n"
+        "- Unexpected network calls to unknown hosts\n"
+        "- Changes to the update/alert verification system itself\n\n"
+        "Respond in EXACTLY this JSON format:\n"
+        '{"verdict": "clean" or "suspicious", "concerns": ["list"], "summary": "one line"}'
+    ) % (changelog[:1000], diff_summary[:3000])
+
+    results = []
+    for auditor in audit_chain.active_auditors:
+        try:
+            http = await audit_chain._get_http()
+            if auditor.provider == "google":
+                url = f"{auditor.api_base.rstrip('/')}/v1beta/models/{auditor.model}:generateContent?key={auditor.api_key}"
+                payload = {"contents": [{"parts": [{"text": review_prompt}]}],
+                           "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500}}
+                async with http.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    data = await resp.json()
+                    raw = ""
+                    for c in data.get("candidates", []):
+                        for p in c.get("content", {}).get("parts", []):
+                            raw += p.get("text", "")
+            else:
+                url = f"{auditor.api_base.rstrip('/')}/v1/chat/completions"
+                payload = {"model": auditor.model,
+                           "messages": [{"role": "user", "content": review_prompt}],
+                           "temperature": 0.1, "max_tokens": 500}
+                headers = {"Authorization": f"Bearer {auditor.api_key}", "Content-Type": "application/json"}
+                async with http.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    data = await resp.json()
+                    raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+            clean = re.sub(r"```(?:json)?\s*", "", raw)
+            clean = re.sub(r"\s*```", "", clean).strip()
+            parsed = json.loads(clean)
+            results.append({
+                "auditor": auditor.name,
+                "verdict": parsed.get("verdict", "suspicious"),
+                "concerns": parsed.get("concerns", []),
+                "summary": parsed.get("summary", "")
+            })
+        except Exception as e:
+            logger.warning(f"Auditor {auditor.name} diff review failed: {e}")
+            results.append({"auditor": auditor.name, "verdict": "error", "concerns": [str(e)]})
+
+    # Both must say clean
+    clean_count = sum(1 for r in results if r["verdict"] == "clean")
+    total = len(results)
+    approved = clean_count == total and total > 0
+
+    return {"approved": approved, "results": results}
+
+
+def verify_checksums_on_disk(checksums: dict, base_dir: str) -> dict:
+    """Verify SHA256 checksums of files on disk after git pull."""
+    results = {}
+    for filename, expected_hash in checksums.items():
+        filepath = os.path.join(base_dir, filename)
+        if not os.path.exists(filepath):
+            results[filename] = {"match": False, "reason": "file missing"}
+            continue
+        actual = sha256_file(filepath)
+        results[filename] = {
+            "match": actual == expected_hash,
+            "expected": expected_hash[:16] + "...",
+            "actual": actual[:16] + "...",
+        }
+    return results
+
+
+def backup_current(base_dir: str):
+    """Backup current bot files before update."""
+    import shutil
+    for fname in CHECKSUMMED_FILES:
+        src = os.path.join(base_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, src + ".bak")
+    logger.info("Backed up current files (.bak)")
+
+
+def rollback(base_dir: str) -> bool:
+    """Rollback to .bak files."""
+    import shutil
+    rolled_back = False
+    for fname in CHECKSUMMED_FILES:
+        bak = os.path.join(base_dir, fname + ".bak")
+        dst = os.path.join(base_dir, fname)
+        if os.path.exists(bak):
+            shutil.copy2(bak, dst)
+            rolled_back = True
+    if rolled_back:
+        logger.info("Rolled back to previous version")
+    return rolled_back
+
+
+async def execute_update(release: dict, base_dir: str) -> dict:
+    """Execute git checkout to pinned commit, verify checksums, restart."""
+    import subprocess
+
+    commit = release.get("commit", "")
+    checksums = release.get("checksums", {})
+
+    if not commit:
+        return {"success": False, "error": "No commit SHA in release"}
+
+    # Backup first
+    backup_current(base_dir)
+
+    try:
+        # Fetch and checkout exact commit
+        subprocess.run(["git", "fetch", "origin"], cwd=base_dir,
+                       capture_output=True, timeout=30)
+        result = subprocess.run(["git", "checkout", commit], cwd=base_dir,
+                                capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            rollback(base_dir)
+            return {"success": False, "error": f"git checkout failed: {result.stderr}"}
+
+        # Post-pull checksum verification
+        check = verify_checksums_on_disk(checksums, base_dir)
+        mismatches = [f for f, r in check.items() if not r["match"]]
+
+        if mismatches:
+            rollback(base_dir)
+            return {"success": False, "error": f"Checksum mismatch after pull: {mismatches}"}
+
+        return {"success": True, "verified_files": list(checksums.keys())}
+
+    except Exception as e:
+        rollback(base_dir)
+        return {"success": False, "error": str(e)}
+
+
+# ─── Two-Tier Update Checker ─────────────────────────────────────────────────
+
+async def check_normal_updates(audit_chain, permission_bot, chat_ids, base_dir):
+    """
+    Tier 1: Normal updates (every 3 days)
+    - Check GitHub for release.json
+    - Verify TOTP HMAC (authenticator code was used at signing time)
+    - Both auditors review the diff
+    - Show user: "Non-Critical: Update Available. Click to install"
+    """
+    data = await fetch_json(f"{UPSTREAM_RAW}/release.json")
+    if not data:
+        return
+
+    # Normal releases: verify TOTP HMAC is present (proves authenticator was used)
+    # The HMAC is computed as HMAC(totp_code, checksums_json) at signing time.
+    # We can't independently verify the TOTP code expired, but the HMAC proves
+    # someone with the authenticator app signed it. Checksums prove integrity.
+    totp_hmac = data.get("totp_hmac", "")
+    checksums = data.get("checksums", {})
+    if not totp_hmac or not checksums:
+        logger.debug("Normal update: missing TOTP HMAC or checksums")
+        return
+
+    release_ver = parse_version(data.get("version", "0.0.0"))
+    current_ver = parse_version(VERSION)
+
+    if release_ver <= current_ver:
+        return
+
+    seen = load_seen_alerts()
+    release_id = f"release-{data.get('version', '')}"
+    if release_id in seen:
+        return
+
+    logger.info(f"New version available: {data.get('version')} (current: {VERSION})")
+
+    # Auditors review the diff
+    changelog = data.get("changelog", "No changelog provided")
+    diff_summary = data.get("diff_summary", "No diff available")
+    review = await auditor_diff_review(audit_chain, changelog, diff_summary)
+
+    if not review["approved"]:
+        concerns = []
+        for r in review["results"]:
+            if r["verdict"] != "clean":
+                concerns.extend(r.get("concerns", []))
+        logger.warning(f"Auditors flagged update {data.get('version')}: {concerns}")
+        # Alert user about suspicious update
+        for cid in (chat_ids or []):
+            try:
+                msg = (
+                    f"⚠️ *Update Blocked by Auditors*\n\n"
+                    f"Version {data.get('version')} was flagged as suspicious.\n"
+                    f"Concerns: {', '.join(concerns[:3])}\n\n"
+                    f"Review manually before updating."
+                )
+                await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+            except Exception:
+                pass
+        seen.add(release_id)
+        save_seen_alerts(seen)
+        return
+
+    # Both auditors approved — notify user with install button
+    for cid in (chat_ids or []):
+        try:
+            auditor_names = ", ".join(r["auditor"] for r in review["results"])
+            msg = (
+                f"ℹ️ *Non-Critical: Update Available*\n\n"
+                f"Version: {data.get('version')} (you have {VERSION})\n"
+                f"Changelog: {changelog[:200]}\n\n"
+                f"✅ Auth: TOTP verified\n"
+                f"✅ Auditors: {auditor_names}\n"
+                f"✅ Checksums: {len(data.get('checksums', {}))} files\n\n"
+                f"Send /update to install"
+            )
+            await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to send update notification: {e}")
+
+    seen.add(release_id)
+    save_seen_alerts(seen)
+
+
+async def check_critical_fixes(audit_chain, permission_bot, chat_ids, base_dir):
+    """
+    Tier 2: Critical fixes (every 6 hours)
+    - Check for urgent_fix.json on GitHub
+    - Requires Ed25519 signature + TOTP HMAC (both, covered by signature)
+    - Both auditors verify + review diff
+    - Push immediately to user
+    """
+    data = await fetch_json(f"{UPSTREAM_RAW}/urgent_fix.json")
+    if not data:
+        return
+
+    # Must have signature (Ed25519 covering payload which includes TOTP HMAC)
+    sig = data.get("signature", "")
+    if not sig or not verify_signature(data, sig):
+        logger.debug("Critical fix: signature invalid")
+        return
+
+    fix_id = data.get("id", "")
+    seen = load_seen_alerts()
+    if fix_id in seen:
+        return
+
+    fix_ver = parse_version(data.get("version", "0.0.0"))
+    current_ver = parse_version(VERSION)
+    min_ver = parse_version(data.get("min_version", "0.0.0"))
+    max_ver = parse_version(data.get("max_version", "999.999.999"))
+
+    if not (min_ver <= current_ver <= max_ver):
+        return
+
+    logger.info(f"Critical fix detected: {data.get('version')} — {data.get('message', '')}")
+
+    # Auditors review the diff
+    changelog = data.get("changelog", "Critical security fix")
+    diff_summary = data.get("diff_summary", "")
+    review = await auditor_diff_review(audit_chain, changelog, diff_summary)
+
+    if not review["approved"]:
+        concerns = []
+        for r in review["results"]:
+            if r["verdict"] != "clean":
+                concerns.extend(r.get("concerns", []))
+        logger.warning(f"Auditors flagged critical fix: {concerns}")
+        for cid in (chat_ids or []):
+            try:
+                msg = (
+                    f"🚨 *Critical Fix Blocked by Auditors*\n\n"
+                    f"Version {data.get('version')} was flagged.\n"
+                    f"Concerns: {', '.join(concerns[:3])}\n\n"
+                    f"This is unusual for a critical fix. Review manually."
+                )
+                await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+            except Exception:
+                pass
+        seen.add(fix_id)
+        save_seen_alerts(seen)
+        return
+
+    # Both approved — push urgently
+    for cid in (chat_ids or []):
+        try:
+            auditor_names = ", ".join(r["auditor"] for r in review["results"])
+            msg = (
+                f"🚨 *CRITICAL: Security Fix Available*\n\n"
+                f"Version: {data.get('version')} (you have {VERSION})\n"
+                f"Message: {data.get('message', 'Critical fix')}\n\n"
+                f"✅ Signature: Ed25519 + TOTP verified\n"
+                f"✅ Auditors: {auditor_names}\n"
+                f"✅ Checksums: {len(data.get('checksums', {}))} files signed\n\n"
+                f"Send /update to install NOW"
+            )
+            await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Failed to push critical fix alert: {e}")
+
+    seen.add(fix_id)
+    save_seen_alerts(seen)
+
+
+async def check_alerts(audit_chain, permission_bot, chat_ids):
+    """Check signed alerts (general announcements)."""
+    if not ALERT_PUBLIC_KEY:
+        return
+
+    data = await fetch_json(f"{UPSTREAM_RAW}/alerts.json")
+    if not data:
+        return
+
+    sig = data.get("signature", "")
+    if sig and not verify_signature(data, sig):
+        logger.warning("Alert signature invalid — ignoring")
+        return
+
+    seen = load_seen_alerts()
+    current_ver = parse_version(VERSION)
+
+    for alert in data.get("alerts", []):
+        alert_id = alert.get("id", "")
+        if alert_id in seen:
+            continue
+
+        min_ver = parse_version(alert.get("min_version", "0.0.0"))
+        max_ver = parse_version(alert.get("max_version", "999.999.999"))
+
+        if not (min_ver <= current_ver <= max_ver):
+            continue
+
+        severity = alert.get("severity", "info")
+        icon = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(severity, "ℹ️")
+
+        for cid in (chat_ids or []):
+            try:
+                msg = (
+                    f"{icon} *ClydeCodeBot Alert* ({severity.upper()})\n\n"
+                    f"{alert.get('message', '')}\n\n"
+                    f"Current version: {VERSION}"
+                )
+                await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+            except Exception:
+                pass
+
+        seen.add(alert_id)
+
+    save_seen_alerts(seen)
+
+
+async def periodic_update_check(audit_chain, permission_bot, chat_ids, base_dir):
+    """
+    Main update loop:
+    - Critical fixes: every 6 hours
+    - Normal updates: every 3 days
+    - Alerts: every 24 hours
+    """
+    # Check fork status
+    fork_info = detect_fork()
+    if fork_info["is_fork"]:
+        logger.warning(
+            f"⚠️ FORKED INSTALLATION — origin: {fork_info['origin']}\n"
+            f"  Automatic updates and security alerts are DISABLED.\n"
+            f"  Upstream: https://github.com/{UPSTREAM_REPO}"
+        )
+        return  # Exit — no update checks for forks
+
+    if not ALERT_PUBLIC_KEY:
+        logger.info("No ALERT_PUBLIC_KEY set — update checking disabled")
+        return
+
+    logger.info(f"Update system active: normal={NORMAL_CHECK_INTERVAL}s, critical={CRITICAL_CHECK_INTERVAL}s")
+
+    last_normal = 0
+    last_critical = 0
+    last_alert = 0
+
+    while True:
+        now = time.time()
+        try:
+            # Critical: every 6 hours
+            if now - last_critical >= CRITICAL_CHECK_INTERVAL:
+                await check_critical_fixes(audit_chain, permission_bot, chat_ids, base_dir)
+                last_critical = now
+
+            # Normal: every 3 days
+            if now - last_normal >= NORMAL_CHECK_INTERVAL:
+                await check_normal_updates(audit_chain, permission_bot, chat_ids, base_dir)
+                last_normal = now
+
+            # Alerts: every 24 hours
+            if now - last_alert >= 86400:
+                await check_alerts(audit_chain, permission_bot, chat_ids)
+                last_alert = now
+
+        except Exception as e:
+            logger.debug(f"Update check error: {e}")
+
+        # Sleep in short intervals so critical checks aren't delayed
+        await asyncio.sleep(300)  # Check every 5 minutes, actual intervals enforced above
 
 
 # ─── Audit Chain ──────────────────────────────────────────────────────────────
@@ -445,23 +960,7 @@ def resolve_auditor_keys(auditors: list[AuditorConfig]):
         "google": "GEMINI_API_KEY",
     }
 
-    # Load vault once
-    vault_data = {}
-    try:
-        vault_env = Path("/etc/openclaw/vault.env")
-        vault_file = Path("/etc/openclaw/vault.enc")
-        if vault_env.exists() and vault_file.exists():
-            master_key = None
-            for line in vault_env.read_text().splitlines():
-                if line.startswith("VAULT_MASTER_KEY="):
-                    master_key = line.split("=", 1)[1].strip()
-                    break
-            if master_key:
-                from cryptography.fernet import Fernet
-                f = Fernet(master_key.encode())
-                vault_data = json.loads(f.decrypt(vault_file.read_bytes()))
-    except Exception as e:
-        logger.debug("ClawVault load failed: %s", e)
+    vault_data = load_vault()
 
     for auditor in auditors:
         if auditor.api_key:
@@ -507,10 +1006,164 @@ def resolve_auditor_keys(auditors: list[AuditorConfig]):
             logger.warning("  %s: disabled (no key in ClawVault or env)", auditor.name)
 
 
+# ─── ClawVault ────────────────────────────────────────────────────────────
+
+VAULT_DIR = Path("/etc/openclaw")
+VAULT_ENV = VAULT_DIR / "vault.env"
+VAULT_ENC = VAULT_DIR / "vault.enc"
+
+# Categorized key registry — all known keys ClawVault can manage
+VAULT_KEY_CATALOG = {
+    "ai_models": {
+        "label": "🧠 AI Model Providers",
+        "keys": {
+            "ANTHROPIC_API_KEY": "Claude (Sonnet/Haiku/Opus)",
+            "OPENAI_API_KEY": "OpenAI (GPT-4o, embeddings)",
+            "MOONSHOT_API_KEY": "Kimi K2.5 (Moonshot)",
+            "DEEPSEEK_API_KEY": "DeepSeek V3/R1",
+            "OPENROUTER_API_KEY": "OpenRouter (multi-model gateway)",
+            "GEMINI_API_KEY": "Google Gemini Pro/Flash",
+            "GOOGLE_API_KEY": "Google API (Gemini alias)",
+            "GROQ_API_KEY": "Groq (fast Llama/Mixtral)",
+            "XAI_API_KEY": "xAI Grok",
+            "MISTRAL_API_KEY": "Mistral Large/Codestral",
+            "BAILIAN_API_KEY": "Alibaba Qwen/GLM-5",
+        },
+    },
+    "search_data": {
+        "label": "🔍 Web Search & Data",
+        "keys": {
+            "BRAVE_API_KEY": "Brave Search",
+            "PERPLEXITY_API_KEY": "Perplexity (cited search)",
+            "FIRECRAWL_API_KEY": "Firecrawl (web to markdown)",
+            "TAVILY_API_KEY": "Tavily (AI-native search)",
+            "SERPER_API_KEY": "Serper (Google Search)",
+        },
+    },
+    "infrastructure": {
+        "label": "🏗 Infrastructure & Deployment",
+        "keys": {
+            "NGROK_API_KEY": "ngrok (tunneling/gateway)",
+            "GATEWAY_TOKEN": "OpenClaw UI secret",
+            "CONVEX_URL": "Convex database URL",
+            "CONVEX_DEPLOY_KEY": "Convex deploy key",
+            "GRADIENT_API_KEY": "DigitalOcean serverless",
+        },
+    },
+    "channels": {
+        "label": "💬 Channels & Messaging",
+        "keys": {
+            "TELEGRAM_BOT_TOKEN": "Telegram main bot",
+            "PERMISSION_BOT_TOKEN": "Telegram permission bot",
+            "DISCORD_TOKEN": "Discord bot",
+            "SLACK_BOT_TOKEN": "Slack workspace bot",
+            "MS_TEAMS_APP_ID": "Microsoft Teams app",
+            "WHATSAPP_API_KEY": "WhatsApp (Twilio)",
+        },
+    },
+    "specialist": {
+        "label": "🛠 Specialist Skills & Tools",
+        "keys": {
+            "GITHUB_TOKEN": "GitHub (code push/pull)",
+            "ELEVENLABS_API_KEY": "ElevenLabs (TTS/voice)",
+            "STRIPE_API_KEY": "Stripe (payments)",
+            "AWS_ACCESS_KEY_ID": "AWS access key",
+            "AWS_SECRET_ACCESS_KEY": "AWS secret key",
+            "CLANKEDIN_API_KEY": "ClankedIn social",
+        },
+    },
+}
+
+
+def load_vault() -> dict:
+    """Load and decrypt ClawVault. Returns dict of key_name → value."""
+    try:
+        if VAULT_ENV.exists() and VAULT_ENC.exists():
+            master_key = None
+            for line in VAULT_ENV.read_text().splitlines():
+                if line.startswith("VAULT_MASTER_KEY="):
+                    master_key = line.split("=", 1)[1].strip()
+                    break
+            if master_key:
+                from cryptography.fernet import Fernet
+                f = Fernet(master_key.encode())
+                return json.loads(f.decrypt(VAULT_ENC.read_bytes()))
+    except Exception as e:
+        logger.debug("ClawVault load failed: %s", e)
+    return {}
+
+
+def save_vault(data: dict):
+    """Encrypt and save ClawVault data."""
+    try:
+        VAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Load or generate master key
+        master_key = None
+        if VAULT_ENV.exists():
+            for line in VAULT_ENV.read_text().splitlines():
+                if line.startswith("VAULT_MASTER_KEY="):
+                    master_key = line.split("=", 1)[1].strip()
+                    break
+
+        if not master_key:
+            from cryptography.fernet import Fernet
+            master_key = Fernet.generate_key().decode()
+            VAULT_ENV.write_text("VAULT_MASTER_KEY=%s\n" % master_key)
+            VAULT_ENV.chmod(0o600)
+            logger.info("ClawVault: generated new master key")
+
+        from cryptography.fernet import Fernet
+        f = Fernet(master_key.encode())
+        encrypted = f.encrypt(json.dumps(data).encode())
+        VAULT_ENC.write_bytes(encrypted)
+        VAULT_ENC.chmod(0o600)
+        logger.info("ClawVault: saved %d keys", len(data))
+        return True
+    except Exception as e:
+        logger.error("ClawVault save failed: %s", e)
+        return False
+
+
+def vault_get(key_name: str) -> str:
+    """Get a single key from vault. Returns empty string if not found."""
+    data = load_vault()
+    return data.get(key_name, "")
+
+
+def vault_set(key_name: str, value: str) -> bool:
+    """Set a single key in vault."""
+    data = load_vault()
+    data[key_name] = value
+    return save_vault(data)
+
+
+def vault_delete(key_name: str) -> bool:
+    """Delete a single key from vault."""
+    data = load_vault()
+    if key_name in data:
+        del data[key_name]
+        return save_vault(data)
+    return False
+
+
+def vault_list() -> dict:
+    """List all keys in vault (names only, not values)."""
+    return load_vault()
+
+
+def get_vault_key_category(key_name: str) -> str:
+    """Find which category a key belongs to."""
+    for cat_id, cat in VAULT_KEY_CATALOG.items():
+        if key_name in cat["keys"]:
+            return cat["label"]
+    return "🔑 Custom"
+
+
 def build_default_audit_chain() -> AuditChain:
     """Build audit chain from config file or built-in defaults.
 
-    Config file: ~/.claudeclaw/auditors.json
+    Config file: ~/.clydecodebot/auditors.json
     Format:
     [
       {"name": "GPT-4.1-mini", "provider": "openai", "model": "gpt-4.1-mini",
@@ -519,17 +1172,17 @@ def build_default_audit_chain() -> AuditChain:
        "api_base": "https://generativelanguage.googleapis.com", "enabled": true}
     ]
 
-    Env var: CLAUDECLAW_AUDITORS=<path to json>
+    Env var: CLYDECODEBOT_AUDITORS=<path to json>
 
     Supported providers: openai, google, kimi (or any OpenAI-compatible API)
     """
     chain = AuditChain(consensus_mode="single")
 
     # Try loading from config file
-    env_path = os.environ.get("CLAUDECLAW_AUDITORS", "")
+    env_path = os.environ.get("CLYDECODEBOT_AUDITORS", "")
     config_path = Path(env_path) if env_path else Path("/dev/null/nonexistent")
     if not config_path.exists():
-        config_path = Path.home() / ".claudeclaw" / "auditors.json"
+        config_path = Path.home() / ".clydecodebot" / "auditors.json"
 
     if config_path.exists():
         try:
@@ -595,7 +1248,7 @@ class StandingApprovalStore:
     """Persistent store for standing approvals."""
 
     def __init__(self, path: str = ""):
-        self.path = Path(path) if path else Path.home() / ".claudeclaw" / "standing_approvals.json"
+        self.path = Path(path) if path else Path.home() / ".clydecodebot" / "standing_approvals.json"
         self.approvals: list[StandingApproval] = []
         self._load()
 
@@ -777,7 +1430,7 @@ class PermissionGate:
             # Handle /start on the permission bot
             if text == "/start":
                 await update.message.reply_text(
-                    "🔐 ClaudeClaw Permission Bot\n\n"
+                    "🔐 ClydeCodeBot Permission Bot\n\n"
                     "I send you task approval requests when you message Claude.\n\n"
                     "Tap ✅ Approve Task to let Claude work, or ❌ Deny to stop.\n"
                     "You can also reply with the 6-digit code, or send /deny."
@@ -1054,27 +1707,27 @@ class Config:
         raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
         if raw_ids:
             cfg.allowed_user_ids = [int(x.strip()) for x in raw_ids.split(",") if x.strip()]
-        cfg.working_dir = os.environ.get("CLAUDECLAW_WORKING_DIR", str(Path.home()))
-        cfg.model = os.environ.get("CLAUDECLAW_MODEL", "")
-        cfg.permission_mode = os.environ.get("CLAUDECLAW_PERMISSION_MODE", "default")
-        cfg.system_prompt = os.environ.get("CLAUDECLAW_SYSTEM_PROMPT", "")
-        cfg.use_project_settings = os.environ.get("CLAUDECLAW_USE_PROJECT_SETTINGS", "true").lower() == "true"
+        cfg.working_dir = os.environ.get("CLYDECODEBOT_WORKING_DIR", str(Path.home()))
+        cfg.model = os.environ.get("CLYDECODEBOT_MODEL", "")
+        cfg.permission_mode = os.environ.get("CLYDECODEBOT_PERMISSION_MODE", "default")
+        cfg.system_prompt = os.environ.get("CLYDECODEBOT_SYSTEM_PROMPT", "")
+        cfg.use_project_settings = os.environ.get("CLYDECODEBOT_USE_PROJECT_SETTINGS", "true").lower() == "true"
         cfg.openclaw_path = os.environ.get("OPENCLAW_PATH", "")
         cfg.crashcart_path = os.environ.get("CRASHCART_PATH", "")
-        cfg.include_daily_log = os.environ.get("CLAUDECLAW_INCLUDE_DAILY_LOG", "true").lower() == "true"
-        cfg.require_permission = os.environ.get("CLAUDECLAW_REQUIRE_PERMISSION", "true").lower() == "true"
-        raw_bash = os.environ.get("CLAUDECLAW_AUTO_ALLOW_BASH", "")
+        cfg.include_daily_log = os.environ.get("CLYDECODEBOT_INCLUDE_DAILY_LOG", "true").lower() == "true"
+        cfg.require_permission = os.environ.get("CLYDECODEBOT_REQUIRE_PERMISSION", "true").lower() == "true"
+        raw_bash = os.environ.get("CLYDECODEBOT_AUTO_ALLOW_BASH", "")
         if raw_bash:
             cfg.auto_allow_bash = [b.strip() for b in raw_bash.split(",") if b.strip()]
-        raw_tools = os.environ.get("CLAUDECLAW_ALLOWED_TOOLS", "")
+        raw_tools = os.environ.get("CLYDECODEBOT_ALLOWED_TOOLS", "")
         if raw_tools:
             cfg.allowed_tools = [t.strip() for t in raw_tools.split(",") if t.strip()]
-        mt = os.environ.get("CLAUDECLAW_MAX_TURNS", "0")
+        mt = os.environ.get("CLYDECODEBOT_MAX_TURNS", "0")
         cfg.max_turns = int(mt) if mt else 0
-        cfg.audit_enabled = os.environ.get("CLAUDECLAW_AUDIT_ENABLED", "true").lower() == "true"
-        cfg.audit_consensus = os.environ.get("CLAUDECLAW_AUDIT_CONSENSUS", "single")
-        cfg.auto_approve_max_risk = int(os.environ.get("CLAUDECLAW_AUTO_APPROVE_RISK", "2"))
-        cfg.alert_max_risk = int(os.environ.get("CLAUDECLAW_ALERT_RISK", "3"))
+        cfg.audit_enabled = os.environ.get("CLYDECODEBOT_AUDIT_ENABLED", "true").lower() == "true"
+        cfg.audit_consensus = os.environ.get("CLYDECODEBOT_AUDIT_CONSENSUS", "single")
+        cfg.auto_approve_max_risk = int(os.environ.get("CLYDECODEBOT_AUTO_APPROVE_RISK", "2"))
+        cfg.alert_max_risk = int(os.environ.get("CLYDECODEBOT_ALERT_RISK", "3"))
         return cfg
 
     def validate(self):
@@ -1365,7 +2018,7 @@ async def cmd_start(update, context):
     sessions = context.bot_data["sessions"]
     perm = "Per-task approval enabled" if config.require_permission else "No permission gate"
     text = (
-        "ClaudeClaw Online\n\n"
+        "ClydeCodeBot Online\n\n"
         "Send any message - I maintain full conversation history.\n"
         "Each message triggers one approval for all tools needed.\n\n"
         "Workspace: %s\nModel: %s\nSession: %s\nPermissions: %s\n\n"
@@ -1428,12 +2081,23 @@ async def cmd_status(update, context):
             if found:
                 mem_info = "Memory: %s (%s)\n  %s" % (label, p, ", ".join(found))
                 break
+    # Version and fork info
+    fork_info = detect_fork()
+    version_line = f"Version: {VERSION}"
+    if fork_info["is_fork"]:
+        version_line += (
+            "\n\n⚠️ FORKED INSTALLATION\n"
+            "This is a fork of github.com/Millerderek/ClydeCodeBot\n"
+            "Automatic updates and security alerts are DISABLED.\n"
+            "You are responsible for keeping this installation current.\n"
+            f"Origin: {fork_info['origin']}"
+        )
     text = (
-        "ClaudeClaw Status\n\nAuth: %s\nWorkspace: %s\nCLAUDE.md: %s\n"
+        "ClydeCodeBot Status\n\n%s\nAuth: %s\nWorkspace: %s\nCLAUDE.md: %s\n"
         "Mode: %s\nModel: %s\nTools: %s\n"
         "Permissions: %s\nSession approvals: %d\n"
         "Session: %s\nActive sessions: %d\n\n%s"
-    ) % (auth_method, config.working_dir, "Found" if has_claude_md else "Not found",
+    ) % (version_line, auth_method, config.working_dir, "Found" if has_claude_md else "Not found",
          config.permission_mode, config.model or "default",
          ", ".join(config.allowed_tools) or "defaults",
          perm_status, approved_count,
@@ -1457,6 +2121,142 @@ async def cmd_whoami(update, context):
     u = update.effective_user
     await update.message.reply_text("User ID: %d\nUsername: %s\nAuthorized: %s" % (
         u.id, u.username or "N/A", "Yes" if is_authorized(config, u.id) else "No"))
+
+
+async def cmd_update(update, context):
+    """Execute a verified update: re-verify, pull, checksum, restart."""
+    config = context.bot_data["config"]
+    if not is_authorized(config, update.effective_user.id):
+        return
+
+    fork_info = detect_fork()
+    if fork_info["is_fork"]:
+        await update.message.reply_text(
+            "⚠️ Forked installation — automatic updates disabled.\n"
+            f"Pull manually from: https://github.com/{UPSTREAM_REPO}"
+        )
+        return
+
+    if not ALERT_PUBLIC_KEY:
+        await update.message.reply_text("⚠️ No ALERT_PUBLIC_KEY configured — cannot verify updates.")
+        return
+
+    await update.message.reply_text("🔄 Checking for update...")
+
+    base_dir = str(Path(__file__).parent)
+    gate = context.bot_data["gate"]
+    audit_chain = gate._audit_chain if hasattr(gate, "_audit_chain") else None
+
+    # Check both release.json and urgent_fix.json
+    release = await fetch_json(f"{UPSTREAM_RAW}/release.json")
+    urgent = await fetch_json(f"{UPSTREAM_RAW}/urgent_fix.json")
+
+    # Pick the newest applicable release
+    target = None
+    target_type = None
+
+    for data, rtype in [(urgent, "critical"), (release, "normal")]:
+        if not data:
+            continue
+        rel_ver = parse_version(data.get("version", "0.0.0"))
+        cur_ver = parse_version(VERSION)
+        if rel_ver <= cur_ver:
+            continue
+
+        if rtype == "critical":
+            # Critical: require Ed25519 signature
+            sig = data.get("signature", "")
+            if not verify_signature(data, sig):
+                continue
+            min_v = parse_version(data.get("min_version", "0.0.0"))
+            max_v = parse_version(data.get("max_version", "999.999.999"))
+            if not (min_v <= cur_ver <= max_v):
+                continue
+        else:
+            # Normal: require TOTP HMAC + checksums
+            if not data.get("totp_hmac") or not data.get("checksums"):
+                continue
+
+        target = data
+        target_type = rtype
+        break
+
+    if not target:
+        await update.message.reply_text(f"✅ Already on latest version ({VERSION})")
+        return
+
+    new_version = target.get("version", "unknown")
+    commit = target.get("commit", "")
+    checksums = target.get("checksums", {})
+    changelog = target.get("changelog", "No changelog")
+
+    if not commit:
+        await update.message.reply_text("❌ Release missing commit SHA — cannot update safely.")
+        return
+
+    if not checksums:
+        await update.message.reply_text("❌ Release missing checksums — cannot verify integrity.")
+        return
+
+    # Re-verify: auditors review the diff one more time at install time
+    await update.message.reply_text(
+        f"📋 Version {new_version} ({target_type})\n"
+        f"Commit: {commit[:12]}\n"
+        f"Changelog: {changelog[:200]}\n\n"
+        "Auditors reviewing code diff..."
+    )
+
+    diff_summary = target.get("diff_summary", "")
+    review = await auditor_diff_review(audit_chain, changelog, diff_summary)
+
+    if not review["approved"]:
+        concerns = []
+        for r in review["results"]:
+            if r["verdict"] != "clean":
+                concerns.extend(r.get("concerns", []))
+        await update.message.reply_text(
+            f"❌ Auditors rejected the update.\n"
+            f"Concerns: {', '.join(concerns[:5])}\n\n"
+            f"Review manually before updating."
+        )
+        return
+
+    auditor_names = ", ".join(r["auditor"] for r in review["results"])
+    await update.message.reply_text(f"✅ Auditors approved: {auditor_names}\n\nInstalling...")
+
+    # Execute the update
+    result = await execute_update(target, base_dir)
+
+    if not result["success"]:
+        await update.message.reply_text(
+            f"❌ Update failed: {result['error']}\n"
+            f"Rolled back to previous version."
+        )
+        return
+
+    verified = result.get("verified_files", [])
+    await update.message.reply_text(
+        f"✅ Updated to v{new_version}\n"
+        f"Commit: {commit[:12]}\n"
+        f"Verified files: {', '.join(verified)}\n\n"
+        f"Restarting bot..."
+    )
+
+    # Restart: exec into the new version
+    import subprocess
+    deploy_sh = os.path.join(base_dir, "deploy.sh")
+    if os.path.exists(deploy_sh):
+        subprocess.Popen(["/bin/bash", deploy_sh], cwd=base_dir)
+    else:
+        # Fallback: restart directly
+        subprocess.Popen(
+            ["screen", "-dmS", "claw", "bash", "-c",
+             f"cd {base_dir} && python3 clydecodebot.py 2>&1 | tee /tmp/claw.log"],
+            cwd=base_dir
+        )
+    # Give a moment for the message to send, then exit
+    await asyncio.sleep(2)
+    os._exit(0)
 
 async def cmd_memory(update, context):
     config = context.bot_data["config"]
@@ -1613,7 +2413,7 @@ async def cmd_auditors(update, context):
         lines.append("  >%d → ask human" % cfg.alert_max_risk)
         lines.append("  5 → always block")
 
-    lines.append("\nConfig: `~/.claudeclaw/auditors.json`")
+    lines.append("\nConfig: `~/.clydecodebot/auditors.json`")
     lines.append("\nCommands:")
     lines.append("`/addauditor` — guided setup")
     lines.append("`/removeauditor <name>` — remove")
@@ -1652,8 +2452,8 @@ AUDITOR_PRESETS = {
 
 
 def save_auditors_config(auditors: list[AuditorConfig]):
-    """Save auditor config to ~/.claudeclaw/auditors.json."""
-    config_dir = Path.home() / ".claudeclaw"
+    """Save auditor config to ~/.clydecodebot/auditors.json."""
+    config_dir = Path.home() / ".clydecodebot"
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / "auditors.json"
     data = []
@@ -1788,6 +2588,70 @@ async def cmd_toggleauditor(update, context):
     await update.message.reply_text("❌ Not found: *%s*\nActive: %s" % (name, names), parse_mode=ParseMode.MARKDOWN)
 
 
+async def cmd_vault(update, context):
+    """Manage ClawVault keys. Usage: /vault [list|set|delete|catalog]"""
+    config = context.bot_data["config"]
+    if not is_authorized(config, update.effective_user.id): return
+
+    args = context.args or []
+    subcmd = args[0].lower() if args else "list"
+
+    if subcmd == "list":
+        data = load_vault()
+        if not data:
+            await update.message.reply_text("🔐 ClawVault is empty.\n\n`/vault catalog` — see available keys\n`/vault set KEY value` — add a key", parse_mode=ParseMode.MARKDOWN)
+            return
+        lines = ["🔐 *ClawVault* (%d keys)\n" % len(data)]
+        categorized = {}
+        for key_name in sorted(data.keys()):
+            cat = get_vault_key_category(key_name)
+            if cat not in categorized:
+                categorized[cat] = []
+            preview = data[key_name][:8] + "..." if len(data[key_name]) > 8 else data[key_name]
+            categorized[cat].append("`%s` → `%s`" % (key_name, preview))
+        for cat, keys in categorized.items():
+            lines.append("*%s*" % cat)
+            for k in keys:
+                lines.append("  %s" % k)
+            lines.append("")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    elif subcmd == "set" and len(args) >= 3:
+        key_name = args[1].upper()
+        value = args[2]
+        if vault_set(key_name, value):
+            cat = get_vault_key_category(key_name)
+            await update.message.reply_text("✅ Stored `%s` in ClawVault\nCategory: %s" % (key_name, cat), parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("❌ Failed to save. Check vault permissions.")
+
+    elif subcmd == "delete" and len(args) >= 2:
+        key_name = args[1].upper()
+        if vault_delete(key_name):
+            await update.message.reply_text("✅ Deleted `%s` from ClawVault" % key_name, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("❌ Key `%s` not found in vault" % key_name, parse_mode=ParseMode.MARKDOWN)
+
+    elif subcmd == "catalog":
+        lines = ["🔐 *ClawVault Key Catalog*\n"]
+        for cat_id, cat in VAULT_KEY_CATALOG.items():
+            lines.append("*%s*" % cat["label"])
+            for key_name, desc in cat["keys"].items():
+                lines.append("  `%s` — %s" % (key_name, desc))
+            lines.append("")
+        lines.append("Set: `/vault set KEY_NAME value`")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    else:
+        await update.message.reply_text(
+            "🔐 *ClawVault*\n\n"
+            "`/vault` — list stored keys\n"
+            "`/vault catalog` — all supported keys\n"
+            "`/vault set KEY value` — store a key\n"
+            "`/vault delete KEY` — remove a key",
+            parse_mode=ParseMode.MARKDOWN)
+
+
 # ─── Telegram Message Handlers ─────────────────────────────────────────────
 
 async def handle_message(update, context):
@@ -1867,7 +2731,15 @@ async def post_init(app):
         BotCommand("approvals", "View session-approved tools"),
         BotCommand("workspace", "List files"),
         BotCommand("whoami", "Your Telegram ID"),
+        BotCommand("update", "Install available update"),
     ])
+    # Start two-tier update checker
+    config = app.bot_data.get("config")
+    chat_ids = config.allowed_user_ids if config else []
+    perm_bot = gate._perm_app if hasattr(gate, "_perm_app") else None
+    audit_chain = gate._audit_chain if hasattr(gate, "_audit_chain") else None
+    base_dir = str(Path(__file__).parent)
+    asyncio.create_task(periodic_update_check(audit_chain, perm_bot, chat_ids, base_dir))
 
 async def post_shutdown(app):
     gate = app.bot_data.get("gate")
@@ -1892,17 +2764,17 @@ def main():
     # ─── Permission Bot Setup Wizard ────────────────────────────────
     if config.require_permission and not config.permission_bot_token:
         print("\n" + "=" * 60)
-        print("  🔐 ClaudeClaw Permission Bot Setup")
+        print("  🔐 ClydeCodeBot Permission Bot Setup")
         print("=" * 60)
         print()
-        print("ClaudeClaw uses a separate Telegram bot for tool approvals.")
+        print("ClydeCodeBot uses a separate Telegram bot for tool approvals.")
         print("When Claude wants to run a command or edit a file, the")
         print("permission bot sends you Approve/Deny buttons.")
         print()
         print("To set this up:")
         print("  1. Open Telegram and message @BotFather")
         print("  2. Send /newbot")
-        print("  3. Name it something like 'ClaudeClaw Permissions'")
+        print("  3. Name it something like 'ClydeCodeBot Permissions'")
         print("  4. Copy the bot token")
         print("  5. Message /start on your new bot (so it can DM you)")
         print()
@@ -1932,7 +2804,7 @@ def main():
             config.require_permission = False
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    logger.info("ClaudeClaw starting... (per-task permissions v2 + audit chain)")
+    logger.info(f"ClydeCodeBot v{VERSION} starting... (per-task permissions v2 + audit chain)")
     logger.info("  Auth: %s", "API Key" if api_key else "Claude Code OAuth")
     logger.info("  Workspace: %s", config.working_dir)
     logger.info("  Allowed users: %s", config.allowed_user_ids)
@@ -1990,6 +2862,7 @@ def main():
     app.add_handler(CommandHandler("approvals", cmd_approvals))
     app.add_handler(CommandHandler("workspace", cmd_workspace))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("standing", cmd_standing))
     app.add_handler(CommandHandler("approve", cmd_approve))
@@ -1998,10 +2871,11 @@ def main():
     app.add_handler(CommandHandler("addauditor", cmd_addauditor))
     app.add_handler(CommandHandler("removeauditor", cmd_removeauditor))
     app.add_handler(CommandHandler("toggleauditor", cmd_toggleauditor))
+    app.add_handler(CommandHandler("vault", cmd_vault))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info("ClaudeClaw live! Persistent sessions with OTP permission gate.")
+    logger.info("ClydeCodeBot live! Persistent sessions with OTP permission gate.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

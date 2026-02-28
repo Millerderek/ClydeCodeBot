@@ -1,9 +1,9 @@
-# ClaudeClaw
+# ClydeCodeBot
 
 Telegram-to-Claude Agent SDK bridge. Single-file Python bot (~1800 LOC).
 
 ## Architecture
-- `claudeclaw.py` — entire bot
+- `clydecodebot.py` — entire bot
 - Uses `ClaudeSDKClient` for persistent per-user conversation sessions
 - Polling-based (no inbound ports needed)
 - Auth: Claude Code OAuth (subscription) preferred, API key fallback
@@ -16,7 +16,7 @@ Telegram-to-Claude Agent SDK bridge. Single-file Python bot (~1800 LOC).
 - `StandingApprovalStore` — persistent pre-approved patterns
 - `SessionManager` — per-user ClaudeSDKClient instances
 - `resolve_auditor_keys()` — ClawVault → env → manual key resolution
-- `build_default_audit_chain()` — loads from ~/.claudeclaw/auditors.json
+- `build_default_audit_chain()` — loads from ~/.clydecodebot/auditors.json
 
 ## Audit Flow
 1. Claude proposes a tool call
@@ -27,7 +27,7 @@ Telegram-to-Claude Agent SDK bridge. Single-file Python bot (~1800 LOC).
 6. Standing approvals can override global thresholds
 
 ## Testing
-- `python3 -c "import ast; ast.parse(open('claudeclaw.py').read()); print('OK')"`
+- `python3 -c "import ast; ast.parse(open('clydecodebot.py').read()); print('OK')"`
 - Send `/start` to your bot on Telegram after launching
 - `/auditors` to verify audit chain config
 - `/standing` to view standing approvals

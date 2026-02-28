@@ -2,13 +2,13 @@
 set -e
 
 # ═══════════════════════════════════════════════════════════════
-# ClaudeClaw Installer
-# curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCode/main/install.sh | bash
+# ClydeCodeBot Installer
+# curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCodeBot/main/install.sh | bash
 # ═══════════════════════════════════════════════════════════════
 
-REPO="https://github.com/Millerderek/ClydeCode.git"
-INSTALL_DIR="$HOME/claudeclaw"
-CONFIG_DIR="$HOME/.claudeclaw"
+REPO="https://github.com/Millerderek/ClydeCodeBot.git"
+INSTALL_DIR="$HOME/clydecodebot"
+CONFIG_DIR="$HOME/.clydecodebot"
 OPENCLAW_DIR="$HOME/.openclaw"
 VAULT_DIR="/etc/openclaw"
 
@@ -24,7 +24,7 @@ step()    { echo -e "\n${CYAN}━━━ $1 ━━━${NC}\n"; }
 
 echo ""
 echo -e "${CYAN}   ╔═══════════════════════════════════════╗${NC}"
-echo -e "${CYAN}   ║${NC}  ${BOLD}🐾 ClaudeClaw${NC}                        ${CYAN}║${NC}"
+echo -e "${CYAN}   ║${NC}  ${BOLD}🐾 ClydeCodeBot${NC}                        ${CYAN}║${NC}"
 echo -e "${CYAN}   ║${NC}  ${DIM}Telegram → Claude Agent SDK Bridge${NC}   ${CYAN}║${NC}"
 echo -e "${CYAN}   ╚═══════════════════════════════════════╝${NC}"
 echo ""
@@ -144,7 +144,7 @@ fi
 # STEP 2: Clone / Update Repo
 # ═══════════════════════════════════════════════════════════════
 
-step "2/9  Install ClaudeClaw"
+step "2/9  Install ClydeCodeBot"
 
 if [ -d "$INSTALL_DIR/.git" ]; then
     info "Updating existing install..."
@@ -165,7 +165,7 @@ info "Installing Python packages..."
 pip install -r requirements.txt --break-system-packages -q 2>/dev/null \
     || pip install -r requirements.txt -q 2>/dev/null \
     || pip3 install -r requirements.txt -q
-success "ClaudeClaw installed at $INSTALL_DIR"
+success "ClydeCodeBot installed at $INSTALL_DIR"
 
 mkdir -p "$CONFIG_DIR"
 
@@ -175,7 +175,7 @@ mkdir -p "$CONFIG_DIR"
 
 step "3/9  Claude Code Authentication"
 
-echo "  ClaudeClaw uses Claude Code OAuth (Pro/Max subscription)."
+echo "  ClydeCodeBot uses Claude Code OAuth (Pro/Max subscription)."
 echo "  No API key needed — just login once."
 echo ""
 
@@ -215,7 +215,7 @@ fi
 
 step "4/9  Telegram Bot Setup"
 
-echo "  ClaudeClaw uses TWO Telegram bots:"
+echo "  ClydeCodeBot uses TWO Telegram bots:"
 echo ""
 echo "    ${BOLD}Main bot${NC}        — your conversation with Claude"
 echo "    ${BOLD}Permission bot${NC}  — approval requests (Approve/Deny buttons)"
@@ -390,16 +390,18 @@ fi
 
 step "7/9  ClawVault (Encrypted Key Storage)"
 
-echo "  ClawVault encrypts your API keys at rest using Fernet."
+echo "  ClawVault encrypts all your API keys at rest using Fernet."
+echo "  Any key stored here is available to ClydeCodeBot and your agent."
+echo ""
 echo "  Keys are stored in $VAULT_DIR/vault.enc"
 echo "  Master key in $VAULT_DIR/vault.env"
 echo ""
 
-SETUP_VAULT="n"
-if [ ${#AUDITOR_LIST[@]} -gt 0 ]; then
-    if read_yn "Store API keys in ClawVault? (recommended)"; then
-        SETUP_VAULT="y"
-    fi
+if read_yn "Set up ClawVault? (recommended)"; then
+    SETUP_VAULT="y"
+else
+    SETUP_VAULT="n"
+    info "Skipped — keys will be read from env vars"
 fi
 
 if [ "$SETUP_VAULT" = "y" ]; then
@@ -422,32 +424,137 @@ if [ "$SETUP_VAULT" = "y" ]; then
         success "Master key found"
     fi
 
-    # Build vault data
+    # Load existing vault if present
+    EXISTING_VAULT="{}"
+    if [ -f "$VAULT_DIR/vault.enc" ]; then
+        EXISTING_VAULT=$(python3 -c "
+from cryptography.fernet import Fernet
+f = Fernet(b'$MASTER_KEY')
+with open('$VAULT_DIR/vault.enc', 'rb') as vf:
+    print(f.decrypt(vf.read()).decode())
+" 2>/dev/null || echo "{}")
+        EXISTING_COUNT=$(echo "$EXISTING_VAULT" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+        success "Existing vault loaded ($EXISTING_COUNT keys)"
+    fi
+
+    # Collect keys — auditor keys already gathered in step 6
+    # Now collect additional service keys
+    echo ""
+    echo "  ${BOLD}Additional API keys (press Enter to skip any):${NC}"
+    echo ""
+    echo "  Auditor keys from Step 6 are already included."
+    echo "  Add any other keys your agent might need:"
+    echo ""
+
+    # Anthropic
+    if [ -n "$ANTHROPIC_API_KEY" ]; then
+        success "Anthropic: already set from Step 3"
+    else
+        read_secret "Anthropic API key (sk-ant-..., Enter to skip)" ANT_KEY
+        [ -n "$ANT_KEY" ] && ANTHROPIC_API_KEY="$ANT_KEY" && success "Anthropic added"
+    fi
+
+    # Cloudflare
+    read_secret "Cloudflare API token (Enter to skip)" CF_KEY
+    [ -n "$CF_KEY" ] && success "Cloudflare added"
+
+    # Twilio
+    read_secret "Twilio Account SID (Enter to skip)" TWILIO_SID
+    if [ -n "$TWILIO_SID" ]; then
+        read_secret "Twilio Auth Secret" TWILIO_SECRET
+        success "Twilio added"
+    fi
+
+    # LiveKit
+    read_secret "LiveKit API key (Enter to skip)" LIVEKIT_KEY
+    if [ -n "$LIVEKIT_KEY" ]; then
+        read_secret "LiveKit API secret" LIVEKIT_SECRET
+        success "LiveKit added"
+    fi
+
+    # Deepgram
+    read_secret "Deepgram API key (Enter to skip)" DEEPGRAM_KEY
+    [ -n "$DEEPGRAM_KEY" ] && success "Deepgram added"
+
+    # Custom keys
+    echo ""
+    while true; do
+        ask "Add custom key? (name=value, or Enter to finish): "
+        read CUSTOM_ENTRY
+        [ -z "$CUSTOM_ENTRY" ] && break
+        CUSTOM_NAME="${CUSTOM_ENTRY%%=*}"
+        CUSTOM_VALUE="${CUSTOM_ENTRY#*=}"
+        if [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_VALUE" ] && [ "$CUSTOM_NAME" != "$CUSTOM_VALUE" ]; then
+            eval "CUSTOM_${CUSTOM_NAME}=\"$CUSTOM_VALUE\""
+            CUSTOM_KEYS+=("$CUSTOM_NAME")
+            success "Added $CUSTOM_NAME"
+        else
+            warn "Format: KEY_NAME=key_value"
+        fi
+    done
+
+    # Build vault JSON
     VAULT_JSON="{"
     FIRST=true
-    [ -n "$OPENAI_KEY" ] && { $FIRST || VAULT_JSON+=","; VAULT_JSON+="\"OPENAI_API_KEY\":\"$OPENAI_KEY\""; FIRST=false; }
-    [ -n "$GOOGLE_KEY" ] && { $FIRST || VAULT_JSON+=","; VAULT_JSON+="\"GOOGLE_API_KEY\":\"$GOOGLE_KEY\""; FIRST=false; }
-    [ -n "$DEEPSEEK_KEY" ] && { $FIRST || VAULT_JSON+=","; VAULT_JSON+="\"DEEPSEEK_API_KEY\":\"$DEEPSEEK_KEY\""; FIRST=false; }
-    [ -n "$GROQ_KEY" ] && { $FIRST || VAULT_JSON+=","; VAULT_JSON+="\"GROQ_API_KEY\":\"$GROQ_KEY\""; FIRST=false; }
-    [ -n "$KIMI_KEY" ] && { $FIRST || VAULT_JSON+=","; VAULT_JSON+="\"KIMI_API_KEY\":\"$KIMI_KEY\""; FIRST=false; }
-    [ -n "$ANTHROPIC_API_KEY" ] && { $FIRST || VAULT_JSON+=","; VAULT_JSON+="\"ANTHROPIC_API_KEY\":\"$ANTHROPIC_API_KEY\""; FIRST=false; }
+
+    add_vault_key() {
+        local key="$1" val="$2"
+        if [ -n "$val" ]; then
+            $FIRST || VAULT_JSON+=","
+            VAULT_JSON+="\"$key\":\"$val\""
+            FIRST=false
+        fi
+    }
+
+    # Auditor keys from step 6
+    add_vault_key "OPENAI_API_KEY" "$OPENAI_KEY"
+    add_vault_key "GOOGLE_API_KEY" "$GOOGLE_KEY"
+    add_vault_key "DEEPSEEK_API_KEY" "$DEEPSEEK_KEY"
+    add_vault_key "GROQ_API_KEY" "$GROQ_KEY"
+    add_vault_key "KIMI_API_KEY" "$KIMI_KEY"
+
+    # Service keys
+    add_vault_key "ANTHROPIC_API_KEY" "$ANTHROPIC_API_KEY"
+    add_vault_key "CLOUDFLARE_API_TOKEN" "$CF_KEY"
+    add_vault_key "TWILIO_ACCOUNT_SID" "$TWILIO_SID"
+    add_vault_key "TWILIO_AUTH_TOKEN" "$TWILIO_SECRET"
+    add_vault_key "LIVEKIT_API_KEY" "$LIVEKIT_KEY"
+    add_vault_key "LIVEKIT_API_SECRET" "$LIVEKIT_SECRET"
+    add_vault_key "DEEPGRAM_API_KEY" "$DEEPGRAM_KEY"
+
+    # Custom keys
+    for ckey in "${CUSTOM_KEYS[@]}"; do
+        eval cval="\$CUSTOM_${ckey}"
+        add_vault_key "$ckey" "$cval"
+    done
+
+    # Merge with existing vault (new keys override)
     VAULT_JSON+="}"
+
+    FINAL_JSON=$(python3 -c "
+import json, sys
+existing = json.loads('''$EXISTING_VAULT''')
+new = json.loads('''$VAULT_JSON''')
+existing.update(new)
+# Remove empty values
+existing = {k:v for k,v in existing.items() if v}
+print(json.dumps(existing))
+")
 
     # Encrypt and save
     python3 -c "
 from cryptography.fernet import Fernet
-import sys
+import json
 f = Fernet(b'$MASTER_KEY')
-data = '''$VAULT_JSON'''.encode()
+data = '''$FINAL_JSON'''.encode()
 enc = f.encrypt(data)
 with open('$VAULT_DIR/vault.enc', 'wb') as vf:
     vf.write(enc)
-print('  ✓ Vault encrypted (%d keys)' % ('''$VAULT_JSON'''.count(':')))
+count = len(json.loads('''$FINAL_JSON'''))
+print(f'  ✓ Vault encrypted ({count} keys)')
 "
     chmod 600 "$VAULT_DIR/vault.enc"
     success "Keys stored in ClawVault"
-else
-    info "Skipped — keys will be read from env vars"
 fi
 
 # ═══════════════════════════════════════════════════════════════
@@ -482,7 +589,7 @@ if [ "$SKIP_SOUL" != "y" ]; then
         1)
             read_default "Agent name" "Claude" AGENT_NAME
             cat > "$OPENCLAW_DIR/soul.md" << SOULEOF
-You are $AGENT_NAME, an AI assistant running on ClaudeClaw.
+You are $AGENT_NAME, an AI assistant running on ClydeCodeBot.
 
 ## Core
 You are helpful, technical, and direct. You skip basics and go straight to implementation unless asked otherwise.
@@ -510,7 +617,7 @@ SOULEOF
         2)
             read_default "Agent name" "Assistant" AGENT_NAME
             cat > "$OPENCLAW_DIR/soul.md" << SOULEOF
-You are $AGENT_NAME, an AI assistant running on ClaudeClaw.
+You are $AGENT_NAME, an AI assistant running on ClydeCodeBot.
 
 ## Core
 You are helpful, technical, and direct.
@@ -551,20 +658,20 @@ step "9/9  Finalize"
 
 # Write .env
 cat > "$INSTALL_DIR/.env" << ENVEOF
-# ClaudeClaw — generated by install.sh $(date +%Y-%m-%d)
+# ClydeCodeBot — generated by install.sh $(date +%Y-%m-%d)
 TELEGRAM_BOT_TOKEN=$MAIN_TOKEN
 PERMISSION_BOT_TOKEN=$PERM_TOKEN
 ALLOWED_USER_IDS=$USER_IDS
-CLAUDECLAW_WORKING_DIR=$HOME
-CLAUDECLAW_PERMISSION_MODE=acceptEdits
-CLAUDECLAW_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash,Glob,Grep,WebSearch,WebFetch
-CLAUDECLAW_REQUIRE_PERMISSION=true
-CLAUDECLAW_AUDIT_ENABLED=$AUDIT_ENABLED
-CLAUDECLAW_AUDIT_CONSENSUS=single
-CLAUDECLAW_AUTO_APPROVE_RISK=2
-CLAUDECLAW_ALERT_RISK=3
+CLYDECODEBOT_WORKING_DIR=$HOME
+CLYDECODEBOT_PERMISSION_MODE=acceptEdits
+CLYDECODEBOT_ALLOWED_TOOLS=Read,Write,Edit,MultiEdit,Bash,Glob,Grep,WebSearch,WebFetch
+CLYDECODEBOT_REQUIRE_PERMISSION=true
+CLYDECODEBOT_AUDIT_ENABLED=$AUDIT_ENABLED
+CLYDECODEBOT_AUDIT_CONSENSUS=single
+CLYDECODEBOT_AUTO_APPROVE_RISK=2
+CLYDECODEBOT_ALERT_RISK=3
 OPENCLAW_PATH=$OPENCLAW_DIR
-CLAUDECLAW_INCLUDE_DAILY_LOG=true
+CLYDECODEBOT_INCLUDE_DAILY_LOG=true
 ENVEOF
 
 [ -n "$ANTHROPIC_API_KEY" ] && [ "$SETUP_VAULT" != "y" ] && echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" >> "$INSTALL_DIR/.env"
@@ -585,12 +692,12 @@ cd "$(dirname "$0")"
 echo "🔪 Stopping old process..."
 screen -ls | grep -q claw && screen -S claw -X quit 2>/dev/null
 sleep 1
-pkill -f "python3.*claudeclaw.py" 2>/dev/null || true
+pkill -f "python3.*clydecodebot.py" 2>/dev/null || true
 sleep 1
 
-echo "🚀 Starting ClaudeClaw..."
+echo "🚀 Starting ClydeCodeBot..."
 > /tmp/claw.log
-screen -dmS claw bash -c "cd $(pwd) && python3 claudeclaw.py 2>&1 | tee /tmp/claw.log"
+screen -dmS claw bash -c "cd $(pwd) && python3 clydecodebot.py 2>&1 | tee /tmp/claw.log"
 sleep 3
 
 echo "═══ Startup Log ═══"
@@ -598,7 +705,7 @@ head -30 /tmp/claw.log
 echo ""
 echo "═══ Status ═══"
 if screen -ls | grep -q claw; then
-    echo "✅ ClaudeClaw running (PID: $(pgrep -f claudeclaw.py))"
+    echo "✅ ClydeCodeBot running (PID: $(pgrep -f clydecodebot.py))"
 else
     echo "❌ Failed to start — check /tmp/claw.log"
 fi
@@ -613,13 +720,13 @@ success "deploy.sh created"
 echo ""
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
-echo -e "  ${GREEN}${BOLD}🐾 ClaudeClaw is ready!${NC}"
+echo -e "  ${GREEN}${BOLD}🐾 ClydeCodeBot is ready!${NC}"
 echo ""
 echo -e "  ${BOLD}Start:${NC}"
-echo -e "    ${CYAN}~/claudeclaw/deploy.sh${NC}"
+echo -e "    ${CYAN}~/clydecodebot/deploy.sh${NC}"
 echo ""
 echo -e "  ${BOLD}Or manually:${NC}"
-echo -e "    ${CYAN}cd ~/claudeclaw && python3 claudeclaw.py${NC}"
+echo -e "    ${CYAN}cd ~/clydecodebot && python3 clydecodebot.py${NC}"
 echo ""
 echo -e "  ${BOLD}Logs:${NC}"
 echo -e "    ${CYAN}tail -f /tmp/claw.log${NC}"
@@ -638,13 +745,13 @@ if [ "$AUTH_METHOD" = "oauth_pending" ]; then
 fi
 
 echo -e "  ${BOLD}Files:${NC}"
-echo -e "    Bot:      $INSTALL_DIR/claudeclaw.py"
+echo -e "    Bot:      $INSTALL_DIR/clydecodebot.py"
 echo -e "    Config:   $INSTALL_DIR/.env"
 echo -e "    Soul:     $OPENCLAW_DIR/soul.md"
 echo -e "    Auditors: $CONFIG_DIR/auditors.json"
 [ "$SETUP_VAULT" = "y" ] && echo -e "    Vault:    $VAULT_DIR/vault.enc"
 echo ""
 
-if read_yn "Start ClaudeClaw now?"; then
+if read_yn "Start ClydeCodeBot now?"; then
     exec "$INSTALL_DIR/deploy.sh"
 fi

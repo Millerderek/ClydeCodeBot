@@ -1,8 +1,8 @@
-# ClaudeClaw
+# ClydeCodeBot
 
 **Telegram → Claude Agent SDK Bridge**
 
-A single-file bot (~2000 LOC) that turns Telegram messages into Claude Code CLI work. Instead of building a new agent platform, ClaudeClaw gives you **mobile remote-control for your existing Claude Code workspace** — same CLAUDE.md, same skills, same MCP servers, same local files.
+A single-file bot (~2000 LOC) that turns Telegram messages into Claude Code CLI work. Instead of building a new agent platform, ClydeCodeBot gives you **mobile remote-control for your existing Claude Code workspace** — same CLAUDE.md, same skills, same MCP servers, same local files.
 
 Uses **Claude Code OAuth** (Pro/Max subscription) by default. No API key required.
 
@@ -10,7 +10,7 @@ Each user gets a **persistent `ClaudeSDKClient` session** — Claude remembers t
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────────────────┐
-│  Telegram    │     │   ClaudeClaw     │     │  Your Workstation       │
+│  Telegram    │     │   ClydeCodeBot     │     │  Your Workstation       │
 │  (mobile)    │────▶│   Bridge Bot     │────▶│                         │
 │              │◀────│                  │◀────│  ├── CLAUDE.md          │
 └─────────────┘     │  SessionManager  │     │  ├── Skills              │
@@ -52,7 +52,7 @@ Have these ready — the installer will prompt for each:
 ### Option A: One-Command Install (Linux/VPS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCode/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCodeBot/main/install.sh | bash
 ```
 
 The interactive wizard walks you through:
@@ -68,12 +68,12 @@ The interactive wizard walks you through:
 ### Option B: Manual Install
 
 ```bash
-git clone https://github.com/Millerderek/ClydeCode.git ~/claudeclaw
-cd ~/claudeclaw
+git clone https://github.com/Millerderek/ClydeCodeBot.git ~/clydecodebot
+cd ~/clydecodebot
 pip install -r requirements.txt
 cp .env.example .env
 # Edit .env: set TELEGRAM_BOT_TOKEN, PERMISSION_BOT_TOKEN, and ALLOWED_USER_IDS
-python3 claudeclaw.py
+python3 clydecodebot.py
 ```
 
 ### Option C: VPS Deploy from Windows (PowerShell)
@@ -95,7 +95,7 @@ type "$env:USERPROFILE\.ssh\id_rsa.pub" | ssh root@YOUR_VPS_IP "mkdir -p ~/.ssh 
 #### Install on VPS (from PowerShell, no password)
 
 ```powershell
-ssh root@YOUR_VPS_IP "curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCode/main/install.sh | bash"
+ssh root@YOUR_VPS_IP "curl -fsSL https://raw.githubusercontent.com/Millerderek/ClydeCodeBot/main/install.sh | bash"
 ```
 
 The wizard runs interactively over SSH. Done.
@@ -106,10 +106,10 @@ The installer auto-generates `deploy.sh` on the VPS. Use it for updates:
 
 ```powershell
 # One-liner: upload new code and restart
-scp "$env:USERPROFILE\Downloads\claudeclaw.py" root@YOUR_VPS_IP:~/claudeclaw/claudeclaw.py; ssh root@YOUR_VPS_IP "~/claudeclaw/deploy.sh"
+scp "$env:USERPROFILE\Downloads\clydecodebot.py" root@YOUR_VPS_IP:~/clydecodebot/clydecodebot.py; ssh root@YOUR_VPS_IP "~/clydecodebot/deploy.sh"
 
 # With auditor config
-scp "$env:USERPROFILE\Downloads\claudeclaw.py" root@YOUR_VPS_IP:~/claudeclaw/claudeclaw.py; scp "$env:USERPROFILE\Downloads\auditors.json" root@YOUR_VPS_IP:~/.claudeclaw/auditors.json; ssh root@YOUR_VPS_IP "~/claudeclaw/deploy.sh"
+scp "$env:USERPROFILE\Downloads\clydecodebot.py" root@YOUR_VPS_IP:~/clydecodebot/clydecodebot.py; scp "$env:USERPROFILE\Downloads\auditors.json" root@YOUR_VPS_IP:~/.clydecodebot/auditors.json; ssh root@YOUR_VPS_IP "~/clydecodebot/deploy.sh"
 ```
 
 #### Check Logs (from PowerShell, no password)
@@ -135,7 +135,7 @@ If you already live inside Claude Code, you're duplicating effort by building:
 - Integrations → **MCP servers already handle this**
 - Orchestration → **The Agent SDK loop already does this**
 
-ClaudeClaw just bridges mobile access to that environment. Improvements apply everywhere.
+ClydeCodeBot just bridges mobile access to that environment. Improvements apply everywhere.
 
 ---
 
@@ -158,17 +158,17 @@ All config via environment variables (or `.env` file). The installer generates t
 | `PERMISSION_BOT_TOKEN` | ✅ | — | Permission bot token from @BotFather |
 | `ALLOWED_USER_IDS` | ✅ | — | Comma-separated Telegram user IDs |
 | `ANTHROPIC_API_KEY` | — | — | Fallback if no OAuth session |
-| `CLAUDECLAW_WORKING_DIR` | — | `~` | Workspace path |
-| `CLAUDECLAW_MODEL` | — | SDK default | Model override |
-| `CLAUDECLAW_PERMISSION_MODE` | — | `default` | `default` or `acceptEdits` |
-| `CLAUDECLAW_ALLOWED_TOOLS` | — | SDK defaults | Comma-separated tool names |
-| `CLAUDECLAW_MAX_TURNS` | — | `0` (unlimited) | Max agent loop turns |
-| `CLAUDECLAW_REQUIRE_PERMISSION` | — | `true` | Per-task approval gate |
-| `CLAUDECLAW_AUDIT_ENABLED` | — | `true` | Enable audit chain |
-| `CLAUDECLAW_AUDIT_CONSENSUS` | — | `single` | `single`, `majority`, `unanimous` |
-| `CLAUDECLAW_AUTO_APPROVE_RISK` | — | `2` | Max risk for silent auto-approve |
-| `CLAUDECLAW_ALERT_RISK` | — | `3` | Max risk for auto-approve with alert |
-| `CLAUDECLAW_AUDITORS` | — | `~/.claudeclaw/auditors.json` | Path to auditors config |
+| `CLYDECODEBOT_WORKING_DIR` | — | `~` | Workspace path |
+| `CLYDECODEBOT_MODEL` | — | SDK default | Model override |
+| `CLYDECODEBOT_PERMISSION_MODE` | — | `default` | `default` or `acceptEdits` |
+| `CLYDECODEBOT_ALLOWED_TOOLS` | — | SDK defaults | Comma-separated tool names |
+| `CLYDECODEBOT_MAX_TURNS` | — | `0` (unlimited) | Max agent loop turns |
+| `CLYDECODEBOT_REQUIRE_PERMISSION` | — | `true` | Per-task approval gate |
+| `CLYDECODEBOT_AUDIT_ENABLED` | — | `true` | Enable audit chain |
+| `CLYDECODEBOT_AUDIT_CONSENSUS` | — | `single` | `single`, `majority`, `unanimous` |
+| `CLYDECODEBOT_AUTO_APPROVE_RISK` | — | `2` | Max risk for silent auto-approve |
+| `CLYDECODEBOT_ALERT_RISK` | — | `3` | Max risk for auto-approve with alert |
+| `CLYDECODEBOT_AUDITORS` | — | `~/.clydecodebot/auditors.json` | Path to auditors config |
 | `OPENCLAW_PATH` | — | — | OpenClaw memory directory |
 | `CRASHCART_PATH` | — | — | ClawCrashCart backup directory |
 
@@ -198,7 +198,7 @@ All config via environment variables (or `.env` file). The installer generates t
 
 ### Dual-Bot Permission System
 
-ClaudeClaw uses **two separate Telegram bots** to keep approval prompts out of your main conversation:
+ClydeCodeBot uses **two separate Telegram bots** to keep approval prompts out of your main conversation:
 
 | Bot | What It Does |
 |-----|-------------|
@@ -264,7 +264,7 @@ Supported providers:
 - `google` — Gemini API
 - `kimi` — Moonshot API
 
-Config auto-saves to `~/.claudeclaw/auditors.json` and persists across restarts.
+Config auto-saves to `~/.clydecodebot/auditors.json` and persists across restarts.
 
 ### API Key Resolution (ClawVault)
 
@@ -293,12 +293,12 @@ Format: `/approve <n> <type> <pattern> [max_risk]`
 
 Types: `bash_prefix`, `bash_exact`, `bash_contains`, `tool`, `skill`
 
-Standing approvals persist in `~/.claudeclaw/standing_approvals.json`.
+Standing approvals persist in `~/.clydecodebot/standing_approvals.json`.
 
 ### Other Protections
 
 - User allowlist via `ALLOWED_USER_IDS`
-- Workspace scoping via `CLAUDECLAW_WORKING_DIR`
+- Workspace scoping via `CLYDECODEBOT_WORKING_DIR`
 - Telegram is NOT e2e encrypted — don't send secrets through the bot
 
 ---
@@ -336,6 +336,8 @@ cd memory && bash setup.sh
 ```
 
 Bundled tools: `openclaw-memo`, `openclaw-custodian`, `clawcrashcart` — all auto-approved.
+
+**ClawVault** (encrypted key storage) is built into ClydeCodeBot itself — no separate install needed. The installer sets it up at `/etc/openclaw/vault.enc`.
 
 ---
 

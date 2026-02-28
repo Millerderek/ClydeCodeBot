@@ -12,3 +12,6 @@ memory/secrets/pg_password.txt
 memory/.session_ingest_state.json
 standing_approvals.json
 auditors.json
+alert_key.pem
+alert_config.json
+*.bak
