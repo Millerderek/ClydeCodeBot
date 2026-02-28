@@ -1,0 +1,35 @@
+[
+  {
+    "name": "GPT-4.1-mini",
+    "provider": "openai",
+    "model": "gpt-4.1-mini",
+    "api_base": "https://api.openai.com",
+    "enabled": true,
+    "timeout": 30
+  },
+  {
+    "name": "Gemini 2.5 Flash",
+    "provider": "google",
+    "model": "gemini-2.5-flash",
+    "api_base": "https://generativelanguage.googleapis.com",
+    "enabled": true,
+    "timeout": 30
+  },
+  {
+    "_comment": "Any OpenAI-compatible API works with provider: openai",
+    "name": "DeepSeek V3",
+    "provider": "openai",
+    "model": "deepseek-chat",
+    "api_base": "https://api.deepseek.com",
+    "enabled": false,
+    "timeout": 30
+  },
+  {
+    "name": "Groq Llama",
+    "provider": "openai",
+    "model": "llama-3.3-70b-versatile",
+    "api_base": "https://api.groq.com/openai",
+    "enabled": false,
+    "timeout": 15
+  }
+]
