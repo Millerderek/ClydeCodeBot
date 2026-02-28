@@ -1608,7 +1608,178 @@ async def cmd_auditors(update, context):
         lines.append("  5 → always block")
 
     lines.append("\nConfig: `~/.claudeclaw/auditors.json`")
+    lines.append("\nCommands:")
+    lines.append("`/addauditor` — guided setup")
+    lines.append("`/removeauditor <name>` — remove")
+    lines.append("`/toggleauditor <name>` — enable/disable")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+# ─── Auditor Presets ──────────────────────────────────────────────────────
+
+AUDITOR_PRESETS = {
+    "gpt-4.1-mini": {
+        "name": "GPT-4.1-mini", "provider": "openai", "model": "gpt-4.1-mini",
+        "api_base": "https://api.openai.com", "env_key": "OPENAI_API_KEY",
+    },
+    "gpt-4.1-nano": {
+        "name": "GPT-4.1-nano", "provider": "openai", "model": "gpt-4.1-nano",
+        "api_base": "https://api.openai.com", "env_key": "OPENAI_API_KEY",
+    },
+    "gemini-2.5-flash": {
+        "name": "Gemini 2.5 Flash", "provider": "google", "model": "gemini-2.5-flash",
+        "api_base": "https://generativelanguage.googleapis.com", "env_key": "GOOGLE_API_KEY",
+    },
+    "deepseek-chat": {
+        "name": "DeepSeek V3", "provider": "openai", "model": "deepseek-chat",
+        "api_base": "https://api.deepseek.com", "env_key": "DEEPSEEK_API_KEY",
+    },
+    "groq-llama": {
+        "name": "Groq Llama 3.3 70B", "provider": "openai", "model": "llama-3.3-70b-versatile",
+        "api_base": "https://api.groq.com/openai", "env_key": "GROQ_API_KEY",
+    },
+    "kimi-k2.5": {
+        "name": "Kimi K2.5", "provider": "kimi", "model": "kimi-k2.5",
+        "api_base": "https://api.moonshot.ai", "env_key": "KIMI_API_KEY",
+    },
+}
+
+
+def save_auditors_config(auditors: list[AuditorConfig]):
+    """Save auditor config to ~/.claudeclaw/auditors.json."""
+    config_dir = Path.home() / ".claudeclaw"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "auditors.json"
+    data = []
+    for a in auditors:
+        data.append({
+            "name": a.name, "provider": a.provider, "model": a.model,
+            "api_base": a.api_base, "enabled": a.enabled, "timeout": a.timeout,
+        })
+    config_path.write_text(json.dumps(data, indent=2))
+    logger.info("Saved %d auditors to %s", len(data), config_path)
+
+
+async def cmd_addauditor(update, context):
+    """Interactive auditor setup — preset or custom."""
+    config = context.bot_data["config"]
+    if not is_authorized(config, update.effective_user.id): return
+    gate = context.bot_data["gate"]
+
+    if not gate._audit_chain:
+        await update.message.reply_text("Audit chain not initialized.")
+        return
+
+    # Check if user provided a preset name
+    if context.args:
+        preset_key = context.args[0].lower()
+        api_key = context.args[1] if len(context.args) > 1 else ""
+
+        if preset_key in AUDITOR_PRESETS:
+            preset = AUDITOR_PRESETS[preset_key]
+            new_auditor = AuditorConfig(
+                name=preset["name"], provider=preset["provider"],
+                model=preset["model"], api_base=preset["api_base"],
+                enabled=True, timeout=30.0,
+            )
+            if api_key:
+                new_auditor.api_key = api_key
+            else:
+                # Try ClawVault / env
+                resolve_auditor_keys([new_auditor])
+
+            if not new_auditor.api_key:
+                await update.message.reply_text(
+                    "🔑 Key needed. Usage:\n"
+                    "`/addauditor %s <api_key>`\n\n"
+                    "Or set `%s` in env/ClawVault." % (preset_key, preset["env_key"]),
+                    parse_mode=ParseMode.MARKDOWN)
+                return
+
+            gate._audit_chain.add_auditor(new_auditor)
+            save_auditors_config(gate._audit_chain.auditors)
+            await update.message.reply_text(
+                "✅ Added *%s* (`%s`)\nKey: `%s...`" % (
+                    new_auditor.name, new_auditor.model, new_auditor.api_key[:8]),
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+        elif preset_key == "custom":
+            # /addauditor custom <name> <provider> <model> <api_base> <api_key>
+            if len(context.args) < 6:
+                await update.message.reply_text(
+                    "Usage:\n`/addauditor custom <name> <provider> <model> <api_base> <api_key>`\n\n"
+                    "Example:\n`/addauditor custom MyModel openai gpt-4o https://api.openai.com sk-xxx`",
+                    parse_mode=ParseMode.MARKDOWN)
+                return
+            _, name, provider, model, api_base, api_key = context.args[:6]
+            new_auditor = AuditorConfig(
+                name=name, provider=provider, model=model,
+                api_base=api_base, api_key=api_key, enabled=True, timeout=30.0,
+            )
+            gate._audit_chain.add_auditor(new_auditor)
+            save_auditors_config(gate._audit_chain.auditors)
+            await update.message.reply_text(
+                "✅ Added *%s* (`%s/%s`)" % (name, provider, model),
+                parse_mode=ParseMode.MARKDOWN)
+            return
+
+    # No args — show preset menu
+    lines = ["🔧 *Add Auditor*\n", "*Quick presets:*"]
+    for key, p in AUDITOR_PRESETS.items():
+        lines.append("`/addauditor %s <key>`  →  %s" % (key, p["name"]))
+    lines.append("\n*Custom:*")
+    lines.append("`/addauditor custom <name> <provider> <model> <api_base> <key>`")
+    lines.append("\n*Providers:* `openai` (any compatible), `google`, `kimi`")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_removeauditor(update, context):
+    """Remove an auditor by name."""
+    config = context.bot_data["config"]
+    if not is_authorized(config, update.effective_user.id): return
+    gate = context.bot_data["gate"]
+
+    if not gate._audit_chain or not context.args:
+        await update.message.reply_text("Usage: `/removeauditor <name>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    name = " ".join(context.args)
+    chain = gate._audit_chain
+    before = len(chain.auditors)
+    chain.auditors = [a for a in chain.auditors if a.name.lower() != name.lower()]
+
+    if len(chain.auditors) < before:
+        save_auditors_config(chain.auditors)
+        await update.message.reply_text("✅ Removed *%s*" % name, parse_mode=ParseMode.MARKDOWN)
+    else:
+        names = ", ".join(a.name for a in chain.auditors)
+        await update.message.reply_text("❌ Not found: *%s*\nActive: %s" % (name, names), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_toggleauditor(update, context):
+    """Enable/disable an auditor by name."""
+    config = context.bot_data["config"]
+    if not is_authorized(config, update.effective_user.id): return
+    gate = context.bot_data["gate"]
+
+    if not gate._audit_chain or not context.args:
+        await update.message.reply_text("Usage: `/toggleauditor <name>`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    name = " ".join(context.args)
+    chain = gate._audit_chain
+
+    for a in chain.auditors:
+        if a.name.lower() == name.lower():
+            a.enabled = not a.enabled
+            save_auditors_config(chain.auditors)
+            status = "✅ enabled" if a.enabled else "⏸ disabled"
+            await update.message.reply_text("*%s*: %s" % (a.name, status), parse_mode=ParseMode.MARKDOWN)
+            return
+
+    names = ", ".join(a.name for a in chain.auditors)
+    await update.message.reply_text("❌ Not found: *%s*\nActive: %s" % (name, names), parse_mode=ParseMode.MARKDOWN)
 
 
 # ─── Telegram Message Handlers ─────────────────────────────────────────────
@@ -1818,6 +1989,9 @@ def main():
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("auditors", cmd_auditors))
+    app.add_handler(CommandHandler("addauditor", cmd_addauditor))
+    app.add_handler(CommandHandler("removeauditor", cmd_removeauditor))
+    app.add_handler(CommandHandler("toggleauditor", cmd_toggleauditor))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 

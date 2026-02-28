@@ -157,33 +157,30 @@ Risk scale: 1 (safe read-only) → 5 (critical system changes).
 
 ### Model-Agnostic Auditors
 
-Configure any model as an auditor via `~/.claudeclaw/auditors.json`:
+Add auditors interactively via Telegram — no config files needed:
 
-```json
-[
-  {
-    "name": "GPT-4.1-mini",
-    "provider": "openai",
-    "model": "gpt-4.1-mini",
-    "api_base": "https://api.openai.com",
-    "enabled": true,
-    "timeout": 30
-  },
-  {
-    "name": "Gemini 2.5 Flash",
-    "provider": "google",
-    "model": "gemini-2.5-flash",
-    "api_base": "https://generativelanguage.googleapis.com",
-    "enabled": true,
-    "timeout": 30
-  }
-]
 ```
+/addauditor                              → show available presets
+/addauditor gpt-4.1-mini sk-proj-xxx     → add from preset + key
+/addauditor gemini-2.5-flash AIzaXxx     → add Gemini
+/addauditor deepseek-chat sk-xxx         → add DeepSeek
+/addauditor groq-llama gsk_xxx           → add Groq
+
+/addauditor custom MyModel openai gpt-4o https://api.openai.com sk-xxx
+
+/toggleauditor GPT-4.1-mini              → enable/disable
+/removeauditor GPT-4.1-mini              → remove
+/auditors                                → view chain status
+```
+
+Available presets: `gpt-4.1-mini`, `gpt-4.1-nano`, `gemini-2.5-flash`, `deepseek-chat`, `groq-llama`, `kimi-k2.5`
 
 Supported providers:
 - `openai` — Any OpenAI-compatible API (OpenAI, DeepSeek, Groq, Together, Ollama, etc.)
 - `google` — Gemini API
 - `kimi` — Moonshot API
+
+Config is auto-saved to `~/.claudeclaw/auditors.json` and persists across restarts.
 
 ### API Key Resolution
 
