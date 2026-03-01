@@ -984,11 +984,12 @@ class AuditChain:
 
         for r in results:
             lines.append("%s *%s* (Risk %d/5): %s" % (
-                verdict_emoji.get(r.verdict, "❓"), r.auditor_name, r.risk, r.summary
+                verdict_emoji.get(r.verdict, "❓"), r.auditor_name, r.risk,
+                _escape_md(r.summary)
             ))
             if r.concerns:
                 for c in r.concerns[:3]:
-                    lines.append("  ⚡ %s" % c)
+                    lines.append("  ⚡ %s" % _escape_md(c))
 
         if len(results) > 1:
             lines.append("\nConsensus (%s): %s" % (
@@ -1746,18 +1747,28 @@ class PermissionGate:
                 pending["future"].set_result((False, False))
                 del gate.pending[uid]
                 await query.answer("Denied")
-                await query.edit_message_text(
-                    query.message.text + "\n\n❌ Task Denied",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                try:
+                    await query.edit_message_text(
+                        query.message.text + "\n\n❌ Task Denied",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception:
+                    await query.edit_message_text(
+                        query.message.text + "\n\n❌ Task Denied"
+                    )
             elif data == "approve_once":
                 pending["future"].set_result((True, False))
                 del gate.pending[uid]
                 await query.answer("Task approved")
-                await query.edit_message_text(
-                    query.message.text + "\n\n✅ Task Approved",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                try:
+                    await query.edit_message_text(
+                        query.message.text + "\n\n✅ Task Approved",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception:
+                    await query.edit_message_text(
+                        query.message.text + "\n\n✅ Task Approved"
+                    )
 
         async def perm_message_handler(update, context):
             uid = update.effective_user.id
@@ -1861,18 +1872,18 @@ class PermissionGate:
 
         code = "%06d" % secrets.randbelow(1000000)
 
-        # Show first tool as preview
+        # Show first tool as preview (escape for Telegram Markdown)
         if tool_name == "Bash":
             cmd = tool_input.get("command", "???")
-            first_tool = "First action: `%s`" % cmd[:200]
+            first_tool = "First action: `%s`" % cmd[:200].replace('`', "'")
         elif tool_name in ("Write", "Edit", "MultiEdit"):
             fp = tool_input.get("file_path", tool_input.get("path", "???"))
-            first_tool = "First action: %s `%s`" % (tool_name, fp)
+            first_tool = "First action: %s `%s`" % (tool_name, fp.replace('`', "'"))
         else:
             first_tool = "First action: %s" % tool_name
 
-        # Truncate task message for display
-        task_preview = task_message[:300]
+        # Truncate task message for display (escape for Telegram Markdown)
+        task_preview = _escape_md(task_message[:300])
         if len(task_message) > 300:
             task_preview += "..."
 
@@ -1907,18 +1918,23 @@ class PermissionGate:
 
         if auto_deny:
             # Notify user of auto-deny
+            msg = (
+                "⛔ Task Auto-Denied by Audit\n\n"
+                "Message:\n_%s_\n\n"
+                "%s\n"
+                "%s"
+            ) % (task_preview, first_tool, audit_section)
             try:
-                msg = (
-                    "⛔ Task Auto-Denied by Audit\n\n"
-                    "Message:\n_%s_\n\n"
-                    "%s\n"
-                    "%s"
-                ) % (task_preview, first_tool, audit_section)
                 await self._perm_bot.send_message(
                     chat_id=user_id, text=msg, parse_mode=ParseMode.MARKDOWN
                 )
-            except Exception as e:
-                logger.debug("Auto-deny notify failed: %s", e)
+            except Exception:
+                try:
+                    await self._perm_bot.send_message(
+                        chat_id=user_id, text=msg
+                    )
+                except Exception as e:
+                    logger.debug("Auto-deny notify failed: %s", e)
             log_audit_trail(user_id, "deny", tool_name, tool_input, "deny", risk, "audit_deny")
             return False
 
@@ -1953,9 +1969,13 @@ class PermissionGate:
         try:
             await self._perm_bot.send_message(chat_id=user_id, text=msg, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         except Exception as e:
-            logger.error("Failed to send task permission to user %d: %s", user_id, e)
-            del self.pending[user_id]
-            return False
+            logger.warning("Markdown send failed, retrying plain text: %s", e)
+            try:
+                await self._perm_bot.send_message(chat_id=user_id, text=msg, reply_markup=keyboard)
+            except Exception as e2:
+                logger.error("Failed to send task permission to user %d: %s", user_id, e2)
+                del self.pending[user_id]
+                return False
 
         # Notify in main chat
         if self._main_bot:
