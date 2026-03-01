@@ -27,7 +27,7 @@ rm -f /tmp/claw.log
 
 # Start fresh
 echo "🚀 Starting ClaudeClaw..."
-screen -dmS claw bash -c 'exec python3 claudeclaw.py >/tmp/claw.log 2>&1'
+screen -dmS claw bash -c 'exec env -u CLAUDECODE python3 clydecodebot.py 2>&1 | tee /tmp/claw.log'
 
 # Wait and show startup
 sleep 8

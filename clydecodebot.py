@@ -52,6 +52,13 @@ def verify_signature(payload_json: dict, signature_b64: str) -> bool:
         return False
 
 
+def mask_key(key: str) -> str:
+    """Mask API key for safe logging."""
+    if not key or len(key) <= 8:
+        return "****"
+    return key[:4] + "..." + key[-4:]
+
+
 def parse_version(v: str) -> tuple:
     """Parse version string to comparable tuple."""
     try:
@@ -330,8 +337,8 @@ async def check_normal_updates(audit_chain, permission_bot, chat_ids, base_dir):
                     f"Review manually before updating."
                 )
                 await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Notification failed: %s", e)
         seen.add(release_id)
         save_seen_alerts(seen)
         return
@@ -410,8 +417,8 @@ async def check_critical_fixes(audit_chain, permission_bot, chat_ids, base_dir):
                     f"This is unusual for a critical fix. Review manually."
                 )
                 await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Notification failed: %s", e)
         seen.add(fix_id)
         save_seen_alerts(seen)
         return
@@ -476,8 +483,8 @@ async def check_alerts(audit_chain, permission_bot, chat_ids):
                     f"Current version: {VERSION}"
                 )
                 await permission_bot.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Notification failed: %s", e)
 
         seen.add(alert_id)
 
@@ -545,6 +552,14 @@ async def periodic_update_check(audit_chain, permission_bot, chat_ids, base_dir)
 #   single   — first auditor decides (v1, Kimi only)
 #   majority — majority must agree (v2, Kimi + Codex)
 #   unanimous — all must agree (v3, Kimi + Codex + Gemini)
+
+def sanitize_for_prompt(text: str) -> str:
+    """Sanitize user input before embedding in auditor prompts."""
+    cleaned = re.sub(r'(?i)respond\s+with\s+\{', '[FILTERED] {', text)
+    cleaned = re.sub(r'(?i)ignore\s+(previous|above|all)\s+instructions?', '[FILTERED]', cleaned)
+    cleaned = re.sub(r'(?i)</?system>', '[FILTERED]', cleaned)
+    return cleaned
+
 
 AUDIT_SYSTEM_PROMPT = """You are a security auditor reviewing AI agent tool calls.
 
@@ -645,6 +660,9 @@ class AuditChain:
         self.consensus_mode = consensus_mode
         self.auditors: list[AuditorConfig] = []
         self._http = None  # aiohttp session, created lazily
+        self._user_call_times: dict[int, list[float]] = {}
+        self._circuit_open_until: float = 0.0
+        self._consecutive_failures: int = 0
 
     def add_auditor(self, auditor: AuditorConfig):
         self.auditors.append(auditor)
@@ -659,6 +677,31 @@ class AuditChain:
     @property
     def is_available(self):
         return len(self.active_auditors) > 0
+
+    def check_rate_limit(self, user_id: int, max_per_minute: int = 10) -> bool:
+        """Return True if rate limit exceeded."""
+        now = time.time()
+        if now < self._circuit_open_until:
+            logger.warning("Audit circuit breaker active, skipping audit")
+            return True
+        times = self._user_call_times.setdefault(user_id, [])
+        self._user_call_times[user_id] = [t for t in times if now - t < 60]
+        if len(self._user_call_times[user_id]) >= max_per_minute:
+            logger.warning("Audit rate limit hit for user %d (%d/min)", user_id, max_per_minute)
+            return True
+        self._user_call_times[user_id].append(now)
+        return False
+
+    def record_failure(self):
+        """Record an audit chain failure for circuit breaker."""
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= 5:
+            self._circuit_open_until = time.time() + 60
+            logger.warning("Audit circuit breaker opened (5 consecutive failures)")
+
+    def record_success(self):
+        """Reset circuit breaker failure count."""
+        self._consecutive_failures = 0
 
     async def _get_http(self):
         if self._http is None or self._http.closed:
@@ -692,7 +735,7 @@ class AuditChain:
             "USER MESSAGE:\n%s\n\n"
             "PROPOSED ACTION:\n%s\n\n"
             "Review this action and respond with JSON."
-        ) % (user_message, action_desc)
+        ) % (sanitize_for_prompt(user_message), action_desc)
 
         # Build API request based on provider
         if auditor.provider == "kimi":
@@ -873,7 +916,16 @@ class AuditChain:
             self._call_auditor(a, user_message, tool_name, tool_input)
             for a in active
         ]
-        results = await asyncio.gather(*tasks)
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=45.0)
+        except asyncio.TimeoutError:
+            logger.warning("Audit chain global timeout (45s)")
+            self.record_failure()
+            return "warn", 3, [AuditResult(
+                auditor_name="system", verdict="warn", risk=3,
+                intent_match=True, concerns=["Audit chain timed out"],
+                summary="Audit timed out — escalating to human", error="global_timeout"
+            )]
 
         # Log results
         for r in results:
@@ -904,7 +956,9 @@ class AuditChain:
             else:
                 final = "warn"
         elif self.consensus_mode == "unanimous":
-            if approve_count == total:
+            if error_results:
+                final = "warn"  # errors break unanimity
+            elif approve_count == total:
                 final = "approve"
             elif deny_count > 0:
                 final = "deny"
@@ -915,6 +969,7 @@ class AuditChain:
 
         logger.info("Audit consensus (%s): %s (risk=%d, %d/%d approve)",
                     self.consensus_mode, final, max_risk, approve_count, total)
+        self.record_success()
         return final, max_risk, results
 
     def format_review_for_telegram(self, results: list[AuditResult],
@@ -982,7 +1037,7 @@ def resolve_auditor_keys(auditors: list[AuditorConfig]):
         for key_name in [provider_key, alt_key]:
             if key_name and key_name in vault_data:
                 auditor.api_key = vault_data[key_name]
-                logger.info("  %s: key from ClawVault ✓ (%s...)", auditor.name, auditor.api_key[:8])
+                logger.info("  %s: key from ClawVault ✓ (%s)", auditor.name, mask_key(auditor.api_key))
                 break
         if auditor.api_key:
             continue
@@ -1577,8 +1632,9 @@ class PermissionGate:
                 await self._perm_bot.send_message(
                     chat_id=user_id, text=msg, parse_mode=ParseMode.MARKDOWN
                 )
-            except:
-                pass
+            except Exception as e:
+                logger.debug("Auto-deny notify failed: %s", e)
+            log_audit_trail(user_id, "deny", tool_name, tool_input, "deny", risk, "audit_deny")
             return False
 
         msg = (
@@ -1623,8 +1679,8 @@ class PermissionGate:
                     chat_id=user_id,
                     text="⏳ Waiting for task approval in the permission bot..."
                 )
-            except:
-                pass
+            except Exception as e:
+                logger.debug("Wait notify failed: %s", e)
 
         try:
             result = await asyncio.wait_for(future, timeout=120)
@@ -1632,6 +1688,7 @@ class PermissionGate:
             if approved:
                 self.task_approved[user_id] = task_id
                 logger.info("Task %s approved for user %d", task_id, user_id)
+                log_audit_trail(user_id, "approve", tool_name, tool_input, "approve", 0, "human")
             return approved
         except asyncio.TimeoutError:
             logger.info("Task permission timeout for user %d", user_id)
@@ -1639,8 +1696,9 @@ class PermissionGate:
                 del self.pending[user_id]
             try:
                 await self._perm_bot.send_message(chat_id=user_id, text="⏰ Task permission expired.")
-            except:
-                pass
+            except Exception as e:
+                logger.debug("Timeout notify failed: %s", e)
+            log_audit_trail(user_id, "deny", tool_name, tool_input, "deny", 0, "timeout")
             return False
 
     def clear_task(self, user_id):
@@ -1778,6 +1836,7 @@ def is_authorized(config, user_id):
 CONTEXT_DIR = CONFIG_DIR / "context"
 CHAT_LOG_DIR = CONTEXT_DIR / "chat_logs"
 TASK_INDEX_PATH = CONTEXT_DIR / "task_index.jsonl"
+AUDIT_TRAIL_PATH = CONTEXT_DIR / "audit_trail.jsonl"
 MAX_CONTEXT_ENTRIES = 100      # Max entries to search
 MAX_INJECTED_CONTEXT = 3       # Top N matches to inject
 CONTEXT_MAX_AGE_DAYS = 90      # Prune entries older than this
@@ -1786,6 +1845,29 @@ CONTEXT_MAX_AGE_DAYS = 90      # Prune entries older than this
 def ensure_context_dirs():
     CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
     CHAT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_audit_trail(user_id: int, action: str, tool_name: str, tool_input: dict,
+                    verdict: str, risk: int = 0, source: str = "human",
+                    details: str = ""):
+    """Append an entry to the persistent audit trail."""
+    ensure_context_dirs()
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "user_id": user_id,
+        "action": action,
+        "tool": tool_name,
+        "command": tool_input.get("command", "")[:200] if tool_name == "Bash" else "",
+        "verdict": verdict,
+        "risk": risk,
+        "source": source,
+        "details": details[:500],
+    }
+    try:
+        with open(AUDIT_TRAIL_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logger.debug("Audit trail write failed: %s", e)
 
 
 def log_chat(user_id: int, role: str, text: str):
@@ -1824,6 +1906,9 @@ def load_task_index(limit: int = MAX_CONTEXT_ENTRIES) -> list[dict]:
 def append_task_index(entry: dict):
     """Append a task summary to the index."""
     ensure_context_dirs()
+    if TASK_INDEX_PATH.exists() and TASK_INDEX_PATH.stat().st_size > 1_000_000:
+        logger.info("Task index exceeds 1MB, compacting...")
+        prune_task_index()
     with open(TASK_INDEX_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
@@ -1845,6 +1930,8 @@ def prune_task_index():
                     entries.append(entry)
             except json.JSONDecodeError:
                 continue
+    entries.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    entries = entries[:MAX_CONTEXT_ENTRIES]
     with open(TASK_INDEX_PATH, "w", encoding="utf-8") as f:
         for entry in entries:
             f.write(json.dumps(entry) + "\n")
@@ -1922,7 +2009,7 @@ async def retrieve_context(audit_chain, user_message: str) -> str:
         "PAST TASK SUMMARIES:\n%s\n\n"
         "Respond with ONLY a JSON array of indices, e.g. [0, 3, 7]. "
         "If nothing is relevant, respond with []."
-    ) % (user_message[:500], summaries_text)
+    ) % (sanitize_for_prompt(user_message[:500]), summaries_text)
 
     result = await _call_first_auditor(audit_chain, retrieval_prompt, max_tokens=100)
     if not result:
@@ -1983,7 +2070,7 @@ async def summarize_task(audit_chain, user_message: str, assistant_response: str
         "Respond with ONLY JSON:\n"
         '{"summary": "1-2 sentence summary", "status": "completed|pending|failed", '
         '"project": "project name or null", "details": "key paths, configs, or decisions"}'
-    ) % (user_message[:1000], assistant_response[:3000])
+    ) % (sanitize_for_prompt(user_message[:1000]), assistant_response[:3000])
 
     result = await _call_first_auditor(audit_chain, summarize_prompt, max_tokens=300)
     if not result:
@@ -2165,73 +2252,82 @@ class SessionManager:
                 
                 verdict, risk, results = None, None, None
                 if gate._audit_chain and gate._audit_chain.is_available:
-                    config = gate._config
-                    auto_max = config.auto_approve_max_risk if config else 2
-                    alert_max = config.alert_max_risk if config else 3
+                    if gate._audit_chain.check_rate_limit(uid):
+                        logger.info("Rate limited user %d — falling through to human approval", uid)
+                    else:
+                        config = gate._config
+                        auto_max = config.auto_approve_max_risk if config else 2
+                        alert_max = config.alert_max_risk if config else 3
 
-                    try:
-                        verdict, risk, results = await gate._audit_chain.review(
-                            task_msg, tool_name, tool_input
-                        )
-                        real_results = [r for r in results if r.error == ""]
-                        any_deny = any(r.verdict == "deny" for r in real_results)
-                        summary = real_results[0].summary if real_results else "OK"
+                        try:
+                            verdict, risk, results = await gate._audit_chain.review(
+                                task_msg, tool_name, tool_input
+                            )
+                            real_results = [r for r in results if r.error == ""]
+                            any_deny = any(r.verdict == "deny" for r in real_results)
+                            summary = real_results[0].summary if real_results else "OK"
 
-                        # Check standing approval first (Layer 2 — can override global)
-                        standing = gate._standing.match(tool_name, tool_input) if gate._standing else None
-                        effective_max = standing.max_risk if standing else alert_max
+                            # Check standing approval first (Layer 2 — can override global)
+                            standing = gate._standing.match(tool_name, tool_input) if gate._standing else None
+                            effective_max = standing.max_risk if standing else alert_max
 
-                        if not any_deny and len(real_results) >= 2 and risk <= effective_max:
-                            if standing:
-                                gate._standing.record_use(standing)
-                            gate.task_approved[uid] = task_id
+                            if any_deny:
+                                logger.info("⛔ Deny verdict overrides auto-approval for %s", tool_name)
+                                # Fall through to human approval
+                            elif len(real_results) >= 2 and risk <= effective_max:
+                                if standing:
+                                    gate._standing.record_use(standing)
+                                gate.task_approved[uid] = task_id
 
-                            if risk <= auto_max:
-                                # Silent auto-approve
-                                logger.info("🟢 Auto-approved (risk %d≤%d): %s for user %d",
-                                           risk, auto_max, tool_name, uid)
-                                # Notify agent of approval status on first tool of task
-                                if gate.task_approved.get(uid) == task_id and not gate._task_notified.get(uid):
-                                    gate._task_notified[uid] = True
+                                if risk <= auto_max:
+                                    # Silent auto-approve
+                                    logger.info("🟢 Auto-approved (risk %d≤%d): %s for user %d",
+                                               risk, auto_max, tool_name, uid)
+                                    # Notify agent of approval status on first tool of task
+                                    if gate.task_approved.get(uid) == task_id and not gate._task_notified.get(uid):
+                                        gate._task_notified[uid] = True
+                                        if gate._main_bot:
+                                            try:
+                                                await gate._main_bot.send_message(
+                                                    chat_id=uid,
+                                                    text="✅ Task approved — executing",
+                                                )
+                                            except Exception as e:
+                                                logger.debug("Auto-approve notify failed: %s", e)
+                                    log_audit_trail(uid, "approve", tool_name, tool_input, verdict, risk, "auto", summary)
+                                    return {}
+                                else:
+                                    # Auto-approve with notification
+                                    label = "[%s] " % standing.name if standing else ""
+                                    logger.info("🟡 Auto-approved+alert (risk %d): %s%s for user %d",
+                                               risk, label, tool_name, uid)
                                     if gate._main_bot:
                                         try:
                                             await gate._main_bot.send_message(
                                                 chat_id=uid,
-                                                text="✅ Task approved — executing",
+                                                text="🤖 Auto-approved: %s%s\n%s (risk %d/5)" % (
+                                                    label, tool_name, summary, risk),
+                                                parse_mode=ParseMode.MARKDOWN
                                             )
-                                        except:
-                                            pass
-                                return {}
+                                        except Exception as e:
+                                            logger.debug("Alert notify failed: %s", e)
+                                    log_audit_trail(uid, "approve", tool_name, tool_input, verdict, risk, "standing" if standing else "auto_alert", summary)
+                                    return {}
+
+                            elif risk >= 5:
+                                logger.info("🔴 Risk 5 — forcing human approval: %s", tool_name)
+                                # Fall through to human approval
+
                             else:
-                                # Auto-approve with notification
-                                label = "[%s] " % standing.name if standing else ""
-                                logger.info("🟡 Auto-approved+alert (risk %d): %s%s for user %d",
-                                           risk, label, tool_name, uid)
-                                if gate._main_bot:
-                                    try:
-                                        await gate._main_bot.send_message(
-                                            chat_id=uid,
-                                            text="🤖 Auto-approved: %s%s\n%s (risk %d/5)" % (
-                                                label, tool_name, summary, risk),
-                                            parse_mode=ParseMode.MARKDOWN
-                                        )
-                                    except:
-                                        pass
-                                return {}
+                                logger.info("⚠️ Audit check: verdict=%s risk=%d any_deny=%s — requesting human",
+                                           verdict, risk, any_deny)
+                                # Fall through to human approval
 
-                        elif risk >= 5:
-                            logger.info("🔴 Risk 5 — forcing human approval: %s", tool_name)
-                            # Fall through to human approval
-
-                        else:
-                            logger.info("⚠️ Audit check: verdict=%s risk=%d any_deny=%s — requesting human",
-                                       verdict, risk, any_deny)
-                            # Fall through to human approval
-
-                    except Exception as e:
-                        logger.error("Autonomous audit error: %s", e)
-                        verdict, risk, results = None, None, None
-                        # Fall through to human approval on error
+                        except Exception as e:
+                            logger.error("Autonomous audit error: %s", e)
+                            gate._audit_chain.record_failure()
+                            verdict, risk, results = None, None, None
+                            # Fall through to human approval on error
 
                 # Request task-level permission (human in the loop)
                 logger.info("Requesting task permission for user %d (first tool: %s)", uid, tool_name)
@@ -2246,8 +2342,8 @@ class SessionManager:
                                 chat_id=uid,
                                 text="✅ Task approved by user — executing",
                             )
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.debug("Approval notify failed: %s", e)
                     return {}  # Allow
                 else:
                     if gate._main_bot:
@@ -2256,8 +2352,9 @@ class SessionManager:
                                 chat_id=uid,
                                 text="❌ Task denied by user",
                             )
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.debug("Denial notify failed: %s", e)
+                    log_audit_trail(uid, "deny", tool_name, tool_input, "deny", 0, "human")
                     return {
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",
@@ -2280,7 +2377,8 @@ class SessionManager:
             client = ClaudeSDKClient(self._build_options(user_id))
             await client.connect()
             self.sessions[user_id] = client
-            self.locks[user_id] = asyncio.Lock()
+            if user_id not in self.locks:
+                self.locks[user_id] = asyncio.Lock()
         return self.sessions[user_id]
 
     async def query(self, user_id, prompt):
@@ -2319,8 +2417,9 @@ class SessionManager:
     async def destroy(self, user_id):
         if user_id in self.sessions:
             try: await self.sessions[user_id].disconnect()
-            except: pass
+            except Exception as e: logger.warning("Session disconnect error %d: %s", user_id, e)
             del self.sessions[user_id]
+            self.locks.pop(user_id, None)
             self.gate.clear_session(user_id)
             logger.info("Session destroyed for user %d", user_id)
 
@@ -2752,7 +2851,7 @@ async def cmd_auditors(update, context):
         lines.append("   Provider: `%s` | Model: `%s`" % (a.provider, a.model))
         lines.append("   API: `%s`" % a.api_base)
         if a.api_key:
-            lines.append("   Key: `%s...`" % a.api_key[:8])
+            lines.append("   Key: `%s`" % mask_key(a.api_key))
         lines.append("")
 
     cfg = gate._config
@@ -2856,7 +2955,7 @@ async def cmd_addauditor(update, context):
             save_auditors_config(gate._audit_chain.auditors)
             await update.message.reply_text(
                 "✅ Added *%s* (`%s`)\nKey: `%s...`" % (
-                    new_auditor.name, new_auditor.model, new_auditor.api_key[:8]),
+                    new_auditor.name, new_auditor.model, mask_key(new_auditor.api_key)),
                 parse_mode=ParseMode.MARKDOWN)
             return
 
@@ -3068,6 +3167,8 @@ async def handle_message(update, context):
 
 async def _post_task_index(audit_chain, user_message, response):
     """Fire-and-forget: summarize and index the completed task."""
+    if len(user_message.strip()) < 10:
+        return
     try:
         entry = await summarize_task(audit_chain, user_message, response)
         if entry:
