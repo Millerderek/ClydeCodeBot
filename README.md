@@ -2,7 +2,7 @@
 
 **Telegram → Claude Agent SDK Bridge**
 
-A single-file bot (~2000 LOC) that turns Telegram messages into Claude Code CLI work. Instead of building a new agent platform, ClydeCodeBot gives you **mobile remote-control for your existing Claude Code workspace** — same CLAUDE.md, same skills, same MCP servers, same local files.
+A single-file bot (~4100 LOC) that turns Telegram messages into Claude Code CLI work. Instead of building a new agent platform, ClydeCodeBot gives you **mobile remote-control for your existing Claude Code workspace** — same CLAUDE.md, same skills, same MCP servers, same local files.
 
 Uses **Claude Code OAuth** (Pro/Max subscription) by default. No API key required.
 
@@ -187,10 +187,63 @@ All config via environment variables (or `.env` file). The installer generates t
 | `/standing` | List standing approvals |
 | `/approve` | Add a standing approval |
 | `/revoke` | Remove a standing approval |
+| `/vault` | Manage ClawVault keys (list / set / delete / catalog) |
+| `/shop` | Product comparison with photos, prices, and reviews |
+| `/cron` | Manage CronBot scheduled jobs (add / enable / pause / delete / trigger) |
 | `/auditors` | View audit chain config |
 | `/addauditor` | Add a new auditor (presets or custom) |
 | `/removeauditor` | Remove an auditor |
 | `/toggleauditor` | Enable/disable an auditor |
+| `/update` | Check for and install verified updates |
+| `/restart` | Restart the bot process |
+| `/exit` | Abort the current Claude task |
+
+---
+
+## Shopping Comparison (`/shop`)
+
+Natural language product search with photo cards, ratings, and buy links.
+
+```
+/shop find me 5 running shoes between 150-200 dollars
+/shop compare 3 wireless headphones under $100
+/shop best gaming laptops
+```
+
+Uses **Serper.dev** (Google Shopping API, free tier) with **Gemini Grounding** as fallback. Results ranked by review count and rating.
+
+Add keys via `/vault set SERPER_API_KEY <key>` or `/vault set GEMINI_API_KEY <key>`.
+
+---
+
+## CronBot Integration (`/cron`)
+
+Manage scheduled AI agent jobs from Telegram. Jobs run as autonomous Claude Code sessions on a cron schedule.
+
+```
+/cron                                         → list all jobs
+/cron add email-check "0 */6 * * *" Check Gmail for unread emails
+/cron enable|disable|pause|resume <id>
+/cron delete <id>
+/cron runs [id]                               → recent execution history
+/cron trigger <id>                            → run immediately
+```
+
+Jobs are stored in `~/.openclaw/cron/jobs.json` and executed by the CronBot daemon. Each job has budget limits, failure thresholds, and auto-pause on consecutive failures.
+
+---
+
+## Context Memory System
+
+Three-tier persistent memory across conversations:
+
+| Tier | Storage | Purpose |
+|------|---------|---------|
+| 1 | `MEMORY.md` | Active state — always in prompt, agent-maintained |
+| 2 | `task_index.jsonl` | Searchable task summaries — auto-indexed after each exchange |
+| 3 | `chat_logs/` | Raw timestamped transcripts — auto-logged |
+
+On each message, the first available auditor retrieves relevant past task summaries and injects them as `<RELEVANT_CONTEXT>` so the agent can pick up where it left off. After each task, the exchange is summarized and appended to the index. Entries older than 90 days are pruned automatically.
 
 ---
 
@@ -235,7 +288,7 @@ User message → Claude proposes tool → Audit Chain reviews → Decision
                               └───────────────────────┘
 ```
 
-Each auditor evaluates: safety, relevance, scope, and prompt injection risk.
+Each auditor evaluates: safety, relevance, scope, and prompt injection risk. Auditors also receive the agent's **stated plan** (last assistant message) as context, enabling better intent alignment — plan-matched actions are treated as one risk level lower.
 
 Risk scale: 1 (safe read-only) → 5 (critical system changes).
 
@@ -261,6 +314,7 @@ Available presets: `gpt-4.1-mini`, `gpt-4.1-nano`, `gemini-2.5-flash`, `deepseek
 
 Supported providers:
 - `openai` — Any OpenAI-compatible API (OpenAI, DeepSeek, Groq, Together, Ollama, etc.)
+- `openrouter` — OpenRouter unified API
 - `google` — Gemini API
 - `kimi` — Moonshot API
 
@@ -347,10 +401,12 @@ Bundled tools: `openclaw-memo`, `openclaw-custodian`, `clawcrashcart` — all au
 2. Auth check against allowlist
 3. Persistent session per user
 4. OpenClaw memory loaded into system prompt
-5. Audit chain reviews each tool proposal
-6. Risk thresholds auto-approve or escalate
-7. Agent loop executes tools
-8. Response chunked to Telegram
+5. Context retrieval — past task summaries injected as `<RELEVANT_CONTEXT>`
+6. Audit chain reviews each tool proposal (with plan context)
+7. Risk thresholds + standing approvals auto-approve or escalate
+8. Agent loop executes tools
+9. Response chunked to Telegram
+10. Task auto-summarized and indexed for future context
 
 ## License
 
