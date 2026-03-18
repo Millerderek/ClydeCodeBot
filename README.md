@@ -169,6 +169,7 @@ All config via environment variables (or `.env` file). The installer generates t
 | `CLYDECODEBOT_AUTO_APPROVE_RISK` | — | `2` | Max risk for silent auto-approve |
 | `CLYDECODEBOT_ALERT_RISK` | — | `3` | Max risk for auto-approve with alert |
 | `CLYDECODEBOT_AUDITORS` | — | `~/.clydecodebot/auditors.json` | Path to auditors config |
+| `CLYDECODEBOT_OWNER_NAME` | — | `the user` | Name used in system prompt (e.g. `Alice`) |
 | `OPENCLAW_PATH` | — | — | OpenClaw memory directory |
 | `CRASHCART_PATH` | — | — | ClawCrashCart backup directory |
 

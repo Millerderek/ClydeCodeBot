@@ -1,6 +1,6 @@
 # ClydeCodeBot
 
-Telegram-to-Claude Agent SDK bridge. Single-file Python bot (~1800 LOC).
+Telegram-to-Claude Agent SDK bridge. Single-file Python bot (~4100 LOC).
 
 ## Architecture
 - `clydecodebot.py` — entire bot

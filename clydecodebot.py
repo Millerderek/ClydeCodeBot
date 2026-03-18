@@ -4,9 +4,10 @@ ClydeCodeBot - Telegram to Claude Agent SDK Bridge
 Uses ClaudeSDKClient for persistent per-user conversation sessions.
 Includes OTP permission gate for tool approvals via Telegram.
 
-Last updated: 2026-02-28 18:55 EST
+Last updated: 2026-03-17
 """
 import os, sys, asyncio, logging, time, re, secrets, json, hashlib
+import ha_panel
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -14,8 +15,10 @@ import aiohttp
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.constants import ParseMode, ChatAction
+from telegram.error import RetryAfter
 from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
+from claude_agent_sdk.types import StreamEvent
 
 logging.basicConfig(format="%(asctime)s [clydecodebot] %(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger("clydecodebot")
@@ -1749,6 +1752,7 @@ class PermissionGate:
         self._audit_chain = None    # AuditChain instance (set externally)
         self._standing = None       # StandingApprovalStore (set externally)
         self._config = None         # ClawConfig (set externally)
+        self._waiting_msgs = {}     # user_id -> message_id of "⏳ Waiting..." in main chat
 
     def set_main_bot(self, bot):
         """Set the main conversation bot (for optional status messages)."""
@@ -1877,7 +1881,8 @@ class PermissionGate:
                 if code == pending["code"]:
                     pending["future"].set_result((True, False))
                     del gate.pending[uid]
-                    await update.message.reply_text("✅ Task approved")
+                    sent = await update.message.reply_text("✅ Task approved")
+                    asyncio.create_task(_delete_after(context.bot, uid, sent.message_id))
                     return
                 else:
                     await update.message.reply_text("❌ Wrong code. Try again or /deny.")
@@ -2053,10 +2058,11 @@ class PermissionGate:
         # Notify in main chat
         if self._main_bot:
             try:
-                await self._main_bot.send_message(
+                waiting_sent = await self._main_bot.send_message(
                     chat_id=user_id,
                     text="⏳ Waiting for task approval in the permission bot..."
                 )
+                self._waiting_msgs[user_id] = waiting_sent.message_id
             except Exception as e:
                 logger.debug("Wait notify failed: %s", e)
 
@@ -2129,6 +2135,7 @@ class Config:
     use_project_settings: bool = True
     openclaw_path: str = ""
     crashcart_path: str = ""
+    owner_name: str = "the user"   # Set via CLYDECODEBOT_OWNER_NAME
     memory_files: list[str] = field(default_factory=lambda: [
         "soul.md", "identity.md", "USER.md", "MEMORY.md",
         "TOOLS.md", "HEARTBEAT.md", "AGENTS.md",
@@ -2183,6 +2190,7 @@ class Config:
         cfg.audit_consensus = os.environ.get("CLYDECODEBOT_AUDIT_CONSENSUS", "single")
         cfg.auto_approve_max_risk = int(os.environ.get("CLYDECODEBOT_AUTO_APPROVE_RISK", "2"))
         cfg.alert_max_risk = int(os.environ.get("CLYDECODEBOT_ALERT_RISK", "3"))
+        cfg.owner_name = os.environ.get("CLYDECODEBOT_OWNER_NAME", "the user")
         return cfg
 
     def validate(self):
@@ -2215,6 +2223,8 @@ CONTEXT_DIR = CONFIG_DIR / "context"
 CHAT_LOG_DIR = CONTEXT_DIR / "chat_logs"
 TASK_INDEX_PATH = CONTEXT_DIR / "task_index.jsonl"
 AUDIT_TRAIL_PATH = CONTEXT_DIR / "audit_trail.jsonl"
+LAST_SESSION_PATH = CONFIG_DIR / "last_session.md"
+LAST_SESSION_LINES = 20
 MAX_CONTEXT_ENTRIES = 100      # Max entries to search
 MAX_INJECTED_CONTEXT = 3       # Top N matches to inject
 CONTEXT_MAX_AGE_DAYS = 90      # Prune entries older than this
@@ -2258,6 +2268,37 @@ def log_chat(user_id: int, role: str, text: str):
         # Truncate very long messages in log
         logged = text[:5000] + ("..." if len(text) > 5000 else "")
         f.write(f"[{ts}] {role} ({user_id}): {logged}\n")
+
+
+def save_last_session():
+    """Snapshot the last N chat log lines to disk for context on next startup."""
+    try:
+        ensure_context_dirs()
+        lines = []
+        for days_ago in range(2):
+            d = (date.today() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+            logfile = CHAT_LOG_DIR / f"{d}.log"
+            if logfile.exists():
+                with open(logfile, "r", encoding="utf-8") as f:
+                    lines = f.readlines() + lines
+        if not lines:
+            return
+        recent = lines[-LAST_SESSION_LINES:]
+        content = "## Last Session (before restart)\n\n" + "".join(recent)
+        LAST_SESSION_PATH.write_text(content, encoding="utf-8")
+        logger.info("Saved last session context (%d lines)", len(recent))
+    except Exception as e:
+        logger.debug("save_last_session failed: %s", e)
+
+
+def load_last_session() -> str:
+    """Load last session snapshot if present."""
+    try:
+        if LAST_SESSION_PATH.exists():
+            return LAST_SESSION_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.debug("load_last_session failed: %s", e)
+    return ""
 
 
 def load_task_index(limit: int = MAX_CONTEXT_ENTRIES) -> list[dict]:
@@ -2544,21 +2585,24 @@ class SessionManager:
         oc = load_openclaw_memory(self.config)
         if oc: sys_parts.append(oc)
         if self.config.system_prompt: sys_parts.append(self.config.system_prompt)
+        last_session = load_last_session()
+        if last_session: sys_parts.append(last_session)
 
         # Tell the agent how the permission system works
         if self.config.require_permission:
+            owner = self.config.owner_name
             sys_parts.append(
                 "## Tool Permission System\n"
                 "Your tool calls go through an automated audit chain. Here's how it works:\n"
                 "- Low-risk tools (reads, file writes, searches) are auto-approved.\n"
                 "- The first tool call in a task triggers a one-time review. Once approved, ALL subsequent tools for this task execute without stopping.\n"
-                "- High-risk tools (deleting files, system commands, secrets) may be escalated to the user.\n"
+                f"- High-risk tools (deleting files, system commands, secrets) may be escalated to {owner}.\n"
                 "- If a tool is denied, you'll get a denial message. Otherwise assume approval and keep going.\n\n"
                 "## Workflow Rules\n"
-                "Match your approach to what the user actually needs:\n\n"
-                "**Questions → Answer them.** If the user asks a question, ANSWER it. Do not start running tools or executing tasks.\n"
-                "  'What's in the mileage tracker .env?' → Read and tell them. Don't start modifying things.\n"
-                "  'How does the audit chain work?' → Explain it. Don't read source code unless they ask you to.\n"
+                f"Match your approach to what {owner} actually needs:\n\n"
+                f"**Questions → Answer them.** If {owner} asks a question, ANSWER it. Do not start running tools or executing tasks.\n"
+                "  'What's in the project .env?' → Read and tell them. Don't start modifying things.\n"
+                "  'How does the audit chain work?' → Explain it. Don't read source code unless asked.\n"
                 "  'Is the deploy script ready?' → Check and report. Don't run it.\n\n"
                 "**Small tasks → Just do it.** Single commands, quick edits, file reads, web searches — execute immediately.\n"
                 "  'Get me the top news stories' → Search and return results.\n"
@@ -2568,15 +2612,19 @@ class SessionManager:
                 "  1. Read relevant files to understand current state\n"
                 "  2. Present a short numbered plan (not paragraphs — just key steps)\n"
                 "  3. Execute efficiently once plan is stated\n\n"
-                "Do NOT say 'waiting for approval' or explain the permission system to the user.\n"
+                f"Do NOT say 'waiting for approval' or explain the permission system to {owner}.\n"
                 "Do NOT list tool call names (like 'Tools: Bash, Write, Read'). Focus on WHAT you're doing, not internals."
             )
 
         # Context memory instructions
+        if self.config.openclaw_path:
+            memory_path = str(Path(self.config.openclaw_path) / "MEMORY.md")
+        else:
+            memory_path = str(Path("~/.openclaw/MEMORY.md").expanduser())
         sys_parts.append(
             "## Context Memory\n"
             "You have persistent memory across sessions:\n"
-            "- MEMORY.md at /root/.openclaw/MEMORY.md — YOUR active scratchpad. Update this after completing significant tasks.\n"
+            f"- MEMORY.md at {memory_path} — YOUR active scratchpad. Update this after completing significant tasks.\n"
             "  Keep it concise: active projects, current state, what's pending. Remove completed items.\n"
             "- Context from past conversations is automatically injected when relevant (in <RELEVANT_CONTEXT> tags).\n"
             "- Chat logs are saved automatically — you don't need to manage those.\n\n"
@@ -2675,10 +2723,11 @@ class SessionManager:
                                         gate._task_notified[uid] = True
                                         if gate._main_bot:
                                             try:
-                                                await gate._main_bot.send_message(
+                                                sent = await gate._main_bot.send_message(
                                                     chat_id=uid,
                                                     text="✅ Task approved — executing",
                                                 )
+                                                asyncio.create_task(_delete_after(gate._main_bot, uid, sent.message_id))
                                             except Exception as e:
                                                 logger.debug("Auto-approve notify failed: %s", e)
                                     log_audit_trail(uid, "approve", tool_name, tool_input, verdict, risk, "auto", summary)
@@ -2690,12 +2739,13 @@ class SessionManager:
                                                risk, label, tool_name, uid)
                                     if gate._main_bot:
                                         try:
-                                            await gate._main_bot.send_message(
+                                            sent = await gate._main_bot.send_message(
                                                 chat_id=uid,
                                                 text="🤖 Auto-approved: %s%s\n%s (risk %d/5)" % (
                                                     label, tool_name, summary, risk),
                                                 parse_mode=ParseMode.MARKDOWN
                                             )
+                                            asyncio.create_task(_delete_after(gate._main_bot, uid, sent.message_id))
                                         except Exception as e:
                                             logger.debug("Alert notify failed: %s", e)
                                     log_audit_trail(uid, "approve", tool_name, tool_input, verdict, risk, "standing" if standing else "auto_alert", summary)
@@ -2725,20 +2775,28 @@ class SessionManager:
                     # Notify agent that human approved
                     if gate._main_bot:
                         try:
-                            await gate._main_bot.send_message(
+                            sent = await gate._main_bot.send_message(
                                 chat_id=uid,
                                 text="✅ Task approved by user — executing",
                             )
+                            waiting_id = gate._waiting_msgs.pop(uid, None)
+                            if waiting_id:
+                                asyncio.create_task(_delete_after(gate._main_bot, uid, waiting_id, delay=60))
+                            asyncio.create_task(_delete_after(gate._main_bot, uid, sent.message_id, delay=60))
                         except Exception as e:
                             logger.debug("Approval notify failed: %s", e)
                     return {}  # Allow
                 else:
                     if gate._main_bot:
                         try:
-                            await gate._main_bot.send_message(
+                            sent = await gate._main_bot.send_message(
                                 chat_id=uid,
                                 text="❌ Task denied by user",
                             )
+                            waiting_id = gate._waiting_msgs.pop(uid, None)
+                            if waiting_id:
+                                asyncio.create_task(_delete_after(gate._main_bot, uid, waiting_id, delay=60))
+                            asyncio.create_task(_delete_after(gate._main_bot, uid, sent.message_id, delay=60))
                         except Exception as e:
                             logger.debug("Denial notify failed: %s", e)
                     log_audit_trail(uid, "deny", tool_name, tool_input, "deny", 0, "human")
@@ -2756,6 +2814,7 @@ class SessionManager:
                 ],
             }
 
+        opts["include_partial_messages"] = True
         return ClaudeAgentOptions(**opts)
 
     async def get_or_create(self, user_id):
@@ -2804,6 +2863,59 @@ class SessionManager:
                 except Exception as e2:
                     return "Agent error: %s: %s" % (type(e2).__name__, e2)
 
+    async def query_streaming(self, user_id, prompt, on_text=None):
+        """Like query() but calls on_text(accumulated_text) as text streams in via StreamEvent."""
+        if user_id not in self.locks:
+            self.locks[user_id] = asyncio.Lock()
+        async with self.locks[user_id]:
+            try:
+                client = await self.get_or_create(user_id)
+                await client.query(prompt)
+                text_parts, tool_log = [], []
+                accumulated = ""
+                thinking_buf = ""
+                async for msg in client.receive_response():
+                    if isinstance(msg, StreamEvent):
+                        event = msg.event
+                        if event.get("type") == "content_block_delta":
+                            delta = event.get("delta", {})
+                            dtype = delta.get("type")
+                            if dtype == "thinking_delta":
+                                thinking_buf += delta.get("thinking", "")
+                                if on_text:
+                                    await on_text(f"⏳ Thinking...\n\n{thinking_buf}")
+                            elif dtype == "text_delta":
+                                accumulated += delta.get("text", "")
+                                if on_text:
+                                    await on_text(accumulated)
+                    elif isinstance(msg, AssistantMessage):
+                        for block in msg.content:
+                            if isinstance(block, TextBlock):
+                                text_parts.append(block.text)
+                                if self.gate:
+                                    self.gate._last_plan[user_id] = block.text
+                            elif isinstance(block, ToolUseBlock):
+                                tool_log.append(block.name)
+                parts = []
+                if tool_log:
+                    logger.info("Tools used: %s", ", ".join(tool_log))
+                if text_parts: parts.append("\n\n".join(text_parts))
+                return "\n\n".join(parts) if parts else "No response generated."
+            except Exception as e:
+                logger.error("Session error user %d: %s", user_id, e, exc_info=True)
+                await self.destroy(user_id)
+                try:
+                    client = await self.get_or_create(user_id)
+                    await client.query(prompt)
+                    text_parts = []
+                    async for msg in client.receive_response():
+                        if isinstance(msg, AssistantMessage):
+                            for block in msg.content:
+                                if isinstance(block, TextBlock): text_parts.append(block.text)
+                    return "\n\n".join(text_parts) if text_parts else "No response (retry)."
+                except Exception as e2:
+                    return "Agent error: %s: %s" % (type(e2).__name__, e2)
+
     async def destroy(self, user_id):
         if user_id in self.sessions:
             try: await self.sessions[user_id].disconnect()
@@ -2826,6 +2938,15 @@ class SessionManager:
 
 
 # ─── Telegram Helpers ───────────────────────────────────────────────────────
+
+async def _delete_after(bot, chat_id, message_id, delay=30):
+    """Delete a Telegram message after `delay` seconds (fire-and-forget)."""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
 
 def chunk_message(text, max_length=4096):
     if len(text) <= max_length: return [text]
@@ -3848,6 +3969,7 @@ async def cmd_restart(update, context):
              f"cd {base_dir} && exec env -u CLAUDECODE python3 clydecodebot.py 2>&1 | tee /tmp/claw.log"],
             cwd=base_dir
         )
+    save_last_session()
     await asyncio.sleep(2)
     os._exit(0)
 
@@ -3901,15 +4023,47 @@ async def handle_message(update, context):
     else:
         augmented_prompt = prompt
 
-    typing_task = asyncio.create_task(keep_typing(update))
+    # Send placeholder that we'll edit live as text streams in
+    live_msg = await update.message.reply_text("⏳")
+
+    last_edit = 0.0
+    edit_interval = 2.0  # throttle: at most 1 edit/2 sec
+
+    async def _fire_edit(text):
+        """Non-blocking fire-and-forget edit — used for live stream updates."""
+        try:
+            await live_msg.edit_text(text)
+        except Exception:
+            pass
+
+    async def _final_edit(text):
+        """Blocking edit with RetryAfter backoff — used for the final response."""
+        for _ in range(6):
+            try:
+                await live_msg.edit_text(text)
+                return
+            except RetryAfter as e:
+                logger.debug("Final edit rate limited, waiting %ss", e.retry_after)
+                await asyncio.sleep(e.retry_after + 1)
+            except Exception:
+                return
+
+    async def on_stream_text(accumulated):
+        nonlocal last_edit
+        now = time.monotonic()
+        if now - last_edit >= edit_interval:
+            last_edit = now
+            asyncio.create_task(_fire_edit(accumulated[-4096:]))
+
     try:
         t0 = time.monotonic()
-        response = await sessions.query(uid, augmented_prompt)
+        response = await sessions.query_streaming(uid, augmented_prompt, on_text=on_stream_text)
         elapsed = time.monotonic() - t0
         logger.info("Response in %.1fs (%d chars)", elapsed, len(response))
 
         # Log raw assistant response
         log_chat(uid, "assistant", response)
+        save_last_session()
 
         # Strip "Tools: ..." lines from the response — internal, not for the user
         cleaned = re.sub(r"^Tools:.*\n?", "", response, flags=re.MULTILINE).strip()
@@ -3917,17 +4071,19 @@ async def handle_message(update, context):
         # Auto-summarize and index the task (fire-and-forget)
         asyncio.create_task(_post_task_index(audit_chain, prompt, response))
 
-        full = cleaned + "\n\n(%.1fs)" % elapsed
-        for chunk in chunk_message(full, config.max_message_length):
+        full = cleaned + "\n\n— Complete — (%.1fs)" % elapsed
+        chunks = chunk_message(full, config.max_message_length)
+        await _final_edit(chunks[0])
+        for chunk in chunks[1:]:
             await update.message.reply_text(chunk)
     except Exception as e:
         logger.error("Error: %s", e, exc_info=True)
-        await update.message.reply_text("Error: %s: %s" % (type(e).__name__, e))
+        try:
+            await live_msg.edit_text("Error: %s: %s" % (type(e).__name__, e))
+        except Exception:
+            await update.message.reply_text("Error: %s: %s" % (type(e).__name__, e))
     finally:
         gate.clear_task(uid)
-        typing_task.cancel()
-        try: await typing_task
-        except asyncio.CancelledError: pass
 
 
 async def _post_task_index(audit_chain, user_message, response):
@@ -3941,6 +4097,48 @@ async def _post_task_index(audit_chain, user_message, response):
             logger.debug("Task indexed: %s", entry.get("summary", "")[:80])
     except Exception as e:
         logger.debug(f"Task indexing failed: {e}")
+
+async def cmd_ha(update, context):
+    """Send a live HA device panel with toggle buttons."""
+    config = context.bot_data["config"]
+    uid = update.effective_user.id
+    if not is_authorized(config, uid):
+        return
+    try:
+        states = ha_panel.get_states()
+        if not states:
+            await update.message.reply_text("⚠️ No HA devices found.")
+            return
+        await update.message.reply_text(
+            ha_panel.build_header(states),
+            reply_markup=ha_panel.build_keyboard(states),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as e:
+        await update.message.reply_text("❌ HA error: %s" % e)
+
+
+async def handle_ha_callback(update, context):
+    """Handle HA panel button taps: toggle device or refresh panel."""
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    config = context.bot_data["config"]
+    if not is_authorized(config, uid):
+        return
+    try:
+        if query.data != "ha_refresh":
+            entity_id = query.data[len("ha_toggle:"):]
+            ha_panel.toggle_entity(entity_id)
+        states = ha_panel.get_states()
+        await query.edit_message_text(
+            ha_panel.build_header(states),
+            reply_markup=ha_panel.build_keyboard(states),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    except Exception as e:
+        await query.edit_message_text("❌ HA error: %s" % e)
+
 
 async def handle_document(update, context):
     config = context.bot_data["config"]
@@ -4010,6 +4208,7 @@ async def post_init(app):
         logger.debug(f"Context memory init: {e}")
 
 async def post_shutdown(app):
+    save_last_session()
     gate = app.bot_data.get("gate")
     if gate:
         await gate.stop_permission_bot()
@@ -4144,6 +4343,8 @@ def main():
     app.add_handler(CommandHandler("cron", cmd_cron))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("exit", cmd_exit))
+    app.add_handler(CommandHandler("ha", cmd_ha))
+    app.add_handler(CallbackQueryHandler(handle_ha_callback, pattern=r"^ha_(toggle:|refresh$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
