@@ -8,6 +8,7 @@ Last updated: 2026-03-17
 """
 import os, sys, asyncio, logging, time, re, secrets, json, hashlib
 import ha_panel
+from clawcomms_bridge import ClawCommsBridge
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -91,6 +92,122 @@ def save_seen_alerts(seen: set):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(SEEN_ALERTS_PATH, "w") as f:
         json.dump(list(seen), f)
+
+
+# ─── Claude OAuth Token Refresh ─────────────────────────────────────────────
+
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+# Refresh if token expires within this many seconds
+OAUTH_REFRESH_BUFFER_SECS = 300  # 5 minutes
+
+
+def _get_credentials_path() -> Path:
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+    return Path(config_dir) / ".credentials.json"
+
+
+def _is_oauth_token_expiring() -> bool:
+    """Return True if no API key is set and the OAuth token is missing or expiring soon."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return False
+    creds_path = _get_credentials_path()
+    try:
+        creds = json.loads(creds_path.read_text())
+        oauth = creds.get("claudeAiOauth", {})
+        expires_at_ms = oauth.get("expiresAt", 0)
+        expires_at_s = expires_at_ms / 1000
+        return time.time() >= (expires_at_s - OAUTH_REFRESH_BUFFER_SECS)
+    except Exception:
+        return False
+
+
+async def refresh_claude_oauth_token() -> bool:
+    """
+    Refresh the Claude Code OAuth access token using the stored refresh token.
+    Updates ~/.claude/.credentials.json in place.
+    Returns True if refreshed successfully, False otherwise.
+    """
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return False  # Using API key auth, nothing to refresh
+
+    creds_path = _get_credentials_path()
+    try:
+        creds = json.loads(creds_path.read_text())
+    except Exception as e:
+        logger.warning("OAuth refresh: could not read credentials: %s", e)
+        return False
+
+    oauth = creds.get("claudeAiOauth", {})
+    refresh_token = oauth.get("refreshToken", "")
+    if not refresh_token:
+        logger.warning("OAuth refresh: no refresh token in credentials")
+        return False
+
+    expires_at_ms = oauth.get("expiresAt", 0)
+    expires_at_s = expires_at_ms / 1000
+    if time.time() < (expires_at_s - OAUTH_REFRESH_BUFFER_SECS):
+        logger.debug("OAuth token still valid, no refresh needed")
+        return False
+
+    logger.info("OAuth token expired or expiring soon — refreshing...")
+    payload = {
+        "grant_type": "refresh_token",
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        "refresh_token": refresh_token,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                CLAUDE_OAUTH_TOKEN_URL,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "User-Agent": "claude-code/2.0.0",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error("OAuth refresh failed (%d): %s", resp.status, body[:200])
+                    return False
+                tokens = await resp.json()
+    except Exception as e:
+        logger.error("OAuth refresh request failed: %s", e)
+        return False
+
+    new_access = tokens.get("access_token", "")
+    if not new_access:
+        logger.error("OAuth refresh: no access_token in response")
+        return False
+
+    # Update credentials in place, preserving any extra fields
+    oauth["accessToken"] = new_access
+    new_refresh = tokens.get("refresh_token")
+    if new_refresh:
+        oauth["refreshToken"] = new_refresh
+    # expires_at may be absolute ms timestamp or relative seconds
+    new_expires = tokens.get("expires_at") or tokens.get("expires_in")
+    if new_expires:
+        if new_expires < 1_000_000_000_000:
+            # Relative seconds — convert to absolute ms
+            oauth["expiresAt"] = int((time.time() + new_expires) * 1000)
+        else:
+            oauth["expiresAt"] = int(new_expires)
+    creds["claudeAiOauth"] = oauth
+
+    try:
+        tmp = creds_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(creds))
+        tmp.replace(creds_path)
+        creds_path.chmod(0o600)
+        logger.info("OAuth token refreshed successfully (expires in ~%ds)",
+                    (oauth["expiresAt"] / 1000) - time.time())
+        return True
+    except Exception as e:
+        logger.error("OAuth refresh: could not write credentials: %s", e)
+        return False
 
 
 def detect_fork() -> dict:
@@ -1701,6 +1818,15 @@ class StandingApprovalStore:
         self._save()
 
 
+# ─── Task Cancellation ──────────────────────────────────────────────────────
+
+class TaskStoppedError(BaseException):
+    """Raised inside permission_hook when the user has requested /stop.
+    Inherits from BaseException so it bypasses all `except Exception` retry blocks
+    and propagates cleanly to the handle_message try/except."""
+    pass
+
+
 # ─── OTP Permission Gate ───────────────────────────────────────────────────
 
 class PermissionGate:
@@ -1753,6 +1879,7 @@ class PermissionGate:
         self._standing = None       # StandingApprovalStore (set externally)
         self._config = None         # ClawConfig (set externally)
         self._waiting_msgs = {}     # user_id -> message_id of "⏳ Waiting..." in main chat
+        self._stop_requested = set()  # user_ids with pending /stop request
 
     def set_main_bot(self, bot):
         """Set the main conversation bot (for optional status messages)."""
@@ -1852,6 +1979,12 @@ class PermissionGate:
             text = update.message.text
             if not text:
                 return
+
+            # Discard stale messages (older than 60 seconds)
+            msg_age = time.time() - update.message.date.timestamp()
+            if msg_age > 60:
+                return
+
             text = text.strip()
 
             # Handle /deny
@@ -1896,7 +2029,7 @@ class PermissionGate:
         # Initialize and start polling
         await self._perm_app.initialize()
         await self._perm_app.start()
-        await self._perm_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await self._perm_app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
         self._perm_bot = self._perm_app.bot
         logger.info("  Permission bot started: @%s", (await self._perm_bot.get_me()).username)
 
@@ -2292,10 +2425,12 @@ def save_last_session():
 
 
 def load_last_session() -> str:
-    """Load last session snapshot if present."""
+    """Load last session snapshot if present, then delete so it's used only once."""
     try:
         if LAST_SESSION_PATH.exists():
-            return LAST_SESSION_PATH.read_text(encoding="utf-8")
+            content = LAST_SESSION_PATH.read_text(encoding="utf-8")
+            LAST_SESSION_PATH.unlink()
+            return content
     except Exception as e:
         logger.debug("load_last_session failed: %s", e)
     return ""
@@ -2414,6 +2549,17 @@ async def retrieve_context(audit_chain, user_message: str) -> str:
     if not entries:
         return ""
 
+    # Filter out entries from the current session (last 2 hours) — already in conversation context
+    now = time.time()
+    session_cutoff = now - (2 * 3600)
+    entries = [
+        e for e in entries
+        if time.mktime(time.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ")) < session_cutoff
+        if e.get("ts")
+    ]
+    if not entries:
+        return ""
+
     # Build summary list for the retriever
     summaries = []
     for i, entry in enumerate(entries[:30]):  # Cap at 30 for prompt size
@@ -2488,7 +2634,11 @@ async def summarize_task(audit_chain, user_message: str, assistant_response: str
         "ASSISTANT:\n%s\n\n"
         "Respond with ONLY JSON:\n"
         '{"summary": "1-2 sentence summary", "status": "completed|pending|failed", '
-        '"project": "project name or null", "details": "key paths, configs, or decisions"}'
+        '"project": "project name or null", "details": "key paths, configs, or decisions"}\n\n'
+        "Status rules: Use 'completed' if the assistant answered the question or provided the information requested — "
+        "even if the user hasn't replied yet. Use 'pending' ONLY if the assistant explicitly left an action item "
+        "unresolved (e.g., waiting for user input to proceed with a deployment, code change, or multi-step task). "
+        "Questions answered = completed. Recommendations given = completed."
     ) % (sanitize_for_prompt(user_message[:1000]), assistant_response[:3000])
 
     result = await _call_first_auditor(audit_chain, summarize_prompt, max_tokens=300)
@@ -2658,6 +2808,12 @@ class SessionManager:
                 tool_name = input_data.get("tool_name", "")
                 tool_input = input_data.get("tool_input", {})
 
+                # Cancel check — /stop sets this flag; fires at next tool boundary
+                if uid in gate._stop_requested:
+                    gate._stop_requested.discard(uid)
+                    logger.info("🛑 /stop triggered for user %d before tool %s", uid, tool_name)
+                    raise TaskStoppedError("Cancelled by user")
+
                 # Auto-allow safe tools
                 if gate.is_auto_allowed(tool_name, tool_input):
                     return {}
@@ -2820,6 +2976,7 @@ class SessionManager:
     async def get_or_create(self, user_id):
         if user_id not in self.sessions:
             logger.info("Creating new session for user %d", user_id)
+            await refresh_claude_oauth_token()
             client = ClaudeSDKClient(self._build_options(user_id))
             await client.connect()
             self.sessions[user_id] = client
@@ -2896,11 +3053,16 @@ class SessionManager:
                                     self.gate._last_plan[user_id] = block.text
                             elif isinstance(block, ToolUseBlock):
                                 tool_log.append(block.name)
+                                if on_text:
+                                    running = ", ".join(tool_log)
+                                    await on_text(f"🔧 {running}…")
                 parts = []
                 if tool_log:
                     logger.info("Tools used: %s", ", ".join(tool_log))
                 if text_parts: parts.append("\n\n".join(text_parts))
                 return "\n\n".join(parts) if parts else "No response generated."
+            except TaskStoppedError:
+                raise  # Propagate to handle_message — no retry
             except Exception as e:
                 logger.error("Session error user %d: %s", user_id, e, exc_info=True)
                 await self.destroy(user_id)
@@ -2996,7 +3158,17 @@ async def cmd_new(update, context):
     if not is_authorized(config, uid): return
     sessions = context.bot_data["sessions"]
     await sessions.destroy(uid)
+    _turn_counters.pop(uid, None)  # Reset ML turn counter
     await update.message.reply_text("Conversation and approvals reset. Send a message to start fresh.")
+
+async def cmd_stop(update, context):
+    """Signal the running task to stop at the next tool call boundary."""
+    config = context.bot_data["config"]
+    uid = update.effective_user.id
+    if not is_authorized(config, uid): return
+    gate = context.bot_data["gate"]
+    gate._stop_requested.add(uid)
+    await update.message.reply_text("⛔ Stop requested — will cancel at next tool call.")
 
 async def cmd_approvals(update, context):
     """Show current session-approved tools."""
@@ -3206,13 +3378,13 @@ async def cmd_update(update, context):
     import subprocess
     deploy_sh = os.path.join(base_dir, "deploy.sh")
     if os.path.exists(deploy_sh):
-        subprocess.Popen(["/bin/bash", deploy_sh], cwd=base_dir)
+        subprocess.Popen(["/bin/bash", deploy_sh], cwd=base_dir, start_new_session=True)
     else:
         # Fallback: restart directly
         subprocess.Popen(
             ["screen", "-dmS", "claw", "bash", "-c",
              f"cd {base_dir} && python3 clydecodebot.py 2>&1 | tee /tmp/claw.log"],
-            cwd=base_dir
+            cwd=base_dir, start_new_session=True
         )
     # Give a moment for the message to send, then exit
     await asyncio.sleep(2)
@@ -3962,12 +4134,12 @@ async def cmd_restart(update, context):
     import subprocess
     deploy_sh = os.path.join(base_dir, "deploy.sh")
     if os.path.exists(deploy_sh):
-        subprocess.Popen(["/bin/bash", deploy_sh], cwd=base_dir)
+        subprocess.Popen(["/bin/bash", deploy_sh], cwd=base_dir, start_new_session=True)
     else:
         subprocess.Popen(
             ["screen", "-dmS", "claw", "bash", "-c",
              f"cd {base_dir} && exec env -u CLAUDECODE python3 clydecodebot.py 2>&1 | tee /tmp/claw.log"],
-            cwd=base_dir
+            cwd=base_dir, start_new_session=True
         )
     save_last_session()
     await asyncio.sleep(2)
@@ -3988,6 +4160,43 @@ async def cmd_exit(update, context):
         await update.message.reply_text("No active session.")
 
 
+# ─── ML Outcome Logging ───────────────────────────────────────────────────
+
+_turn_counters = {}  # uid -> int — per-user turn counter for ML labeling
+_DAEMON_SOCK = "/tmp/clyde-memo.sock"
+
+
+async def _post_log_outcome(session_id, turn_number, response_text):
+    """Fire-and-forget: send log_outcome to memo daemon for ML labeling."""
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _sync_log_outcome, session_id, turn_number, response_text)
+    except Exception as e:
+        logger.debug(f"log_outcome failed: {e}")
+
+
+def _sync_log_outcome(session_id, turn_number, response_text):
+    """Blocking daemon socket call for log_outcome."""
+    import socket as sock_mod
+    try:
+        s = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+        s.settimeout(10)
+        s.connect(_DAEMON_SOCK)
+        payload = json.dumps({
+            "method": "log_outcome",
+            "params": {
+                "session_id": session_id,
+                "turn_number": turn_number,
+                "response_text": response_text[:10000],
+            }
+        })
+        s.sendall(payload.encode() + b"\n")
+        s.recv(4096)  # consume ack
+        s.close()
+    except Exception:
+        pass  # Non-fatal — don't break the bot over ML logging
+
+
 # ─── Telegram Message Handlers ─────────────────────────────────────────────
 
 async def handle_message(update, context):
@@ -3998,9 +4207,23 @@ async def handle_message(update, context):
     prompt = update.message.text
     if not prompt: return
 
+    # Discard stale messages (older than 60 seconds) — safety net for restarts
+    msg_age = time.time() - update.message.date.timestamp()
+    if msg_age > 60:
+        logger.info("Discarding stale message from user %d (%.0fs old)", uid, msg_age)
+        return
+
     logger.info("User %d: %s", uid, prompt[:100])
     sessions = context.bot_data["sessions"]
     gate = context.bot_data["gate"]
+
+    # Increment turn counter for ML outcome logging
+    _turn_counters[uid] = _turn_counters.get(uid, 0) + 1
+    turn_number = _turn_counters[uid]
+
+    # Set env vars so openclaw-memo CLI can tag retrievals with session context
+    os.environ["OPENCLAW_SESSION_ID"] = f"tg-{uid}"
+    os.environ["OPENCLAW_TURN_NUMBER"] = str(turn_number)
 
     # Log raw user message
     log_chat(uid, "user", prompt)
@@ -4071,11 +4294,28 @@ async def handle_message(update, context):
         # Auto-summarize and index the task (fire-and-forget)
         asyncio.create_task(_post_task_index(audit_chain, prompt, response))
 
+        # ML-0: Log response for retroactive labeling (fire-and-forget)
+        session_id = f"tg-{uid}"
+        asyncio.create_task(_post_log_outcome(session_id, turn_number, response))
+
         full = cleaned + "\n\n— Complete — (%.1fs)" % elapsed
         chunks = chunk_message(full, config.max_message_length)
         await _final_edit(chunks[0])
         for chunk in chunks[1:]:
             await update.message.reply_text(chunk)
+
+        # Save to shared web history (fire-and-forget)
+        asyncio.create_task(
+            asyncio.get_event_loop().run_in_executor(
+                None, _append_web_history, prompt, cleaned
+            )
+        )
+    except TaskStoppedError:
+        logger.info("🛑 Task stopped by user %d", uid)
+        try:
+            await live_msg.edit_text("⛔ Stopped.")
+        except Exception:
+            await update.message.reply_text("⛔ Stopped.")
     except Exception as e:
         logger.error("Error: %s", e, exc_info=True)
         try:
@@ -4084,6 +4324,48 @@ async def handle_message(update, context):
             await update.message.reply_text("Error: %s: %s" % (type(e).__name__, e))
     finally:
         gate.clear_task(uid)
+
+
+WEB_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "../openclaw-web/data/history.jsonl")
+
+def _append_web_history(user_text: str, assistant_text: str, source: str = "telegram"):
+    """Append a completed exchange to the shared web-app history file."""
+    try:
+        path = os.path.abspath(WEB_HISTORY_FILE)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        now_ms = int(time.time() * 1000)
+        entries = [
+            {
+                "id": os.urandom(8).hex(),
+                "conversationId": "default",
+                "role": "user",
+                "content": user_text,
+                "timestamp": now_ms - 1,
+                "status": "sent",
+                "source": source,
+            },
+            {
+                "id": os.urandom(8).hex(),
+                "conversationId": "default",
+                "role": "assistant",
+                "content": assistant_text,
+                "timestamp": now_ms,
+                "status": "sent",
+                "source": source,
+            },
+        ]
+        with open(path, "a", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+
+        # Trim to 200 messages
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        if len(lines) > 200:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines[-200:]) + "\n")
+    except Exception as e:
+        logger.debug("web history write failed: %s", e)
 
 
 async def _post_task_index(audit_chain, user_message, response):
@@ -4198,6 +4480,25 @@ async def post_init(app):
     base_dir = str(Path(__file__).parent)
     asyncio.create_task(periodic_update_check(audit_chain, perm_bot, chat_ids, base_dir))
 
+    # Start ClawComms bridge
+    try:
+        clawcomms_chat_id = int((config.allowed_user_ids or [8260442678])[0])
+        bridge = ClawCommsBridge(app.bot, chat_id=clawcomms_chat_id)
+        app.bot_data["clawcomms_bridge"] = bridge
+        await bridge.start()
+    except Exception as e:
+        logger.warning(f"ClawComms bridge failed to start: {e}")
+
+    # Start web API (shared session with Telegram)
+    try:
+        from web_api import start_web_api
+        config = app.bot_data.get("config")
+        owner_id = int((config.allowed_user_ids or [8260442678])[0])
+        web_runner = await start_web_api(app.bot_data["sessions"], owner_id)
+        app.bot_data["web_runner"] = web_runner
+    except Exception as e:
+        logger.warning(f"Web API failed to start: {e}")
+
     # Initialize context memory system
     ensure_context_dirs()
     try:
@@ -4216,6 +4517,12 @@ async def post_shutdown(app):
             await gate._audit_chain.close()
     sessions = app.bot_data.get("sessions")
     if sessions: await sessions.destroy_all()
+    bridge = app.bot_data.get("clawcomms_bridge")
+    if bridge:
+        await bridge.stop()
+    web_runner = app.bot_data.get("web_runner")
+    if web_runner:
+        await web_runner.cleanup()
 
 def main():
     from dotenv import load_dotenv
@@ -4273,6 +4580,16 @@ def main():
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     logger.info(f"ClydeCodeBot v{VERSION} starting... (per-task permissions v2 + audit chain)")
     logger.info("  Auth: %s", "API Key" if api_key else "Claude Code OAuth")
+
+    # Refresh OAuth token at startup if needed
+    if not api_key and _is_oauth_token_expiring():
+        import asyncio as _asyncio
+        try:
+            refreshed = _asyncio.get_event_loop().run_until_complete(refresh_claude_oauth_token())
+            if not refreshed:
+                logger.warning("  OAuth token expired and refresh failed — bot may fail to connect")
+        except Exception as e:
+            logger.warning("  OAuth startup refresh error: %s", e)
     logger.info("  Workspace: %s", config.working_dir)
     logger.info("  Allowed users: %s", config.allowed_user_ids)
     logger.info("  Session mode: persistent (ClaudeSDKClient)")
@@ -4341,6 +4658,7 @@ def main():
     app.add_handler(CommandHandler("vault", cmd_vault))
     app.add_handler(CommandHandler("shop", cmd_shop))
     app.add_handler(CommandHandler("cron", cmd_cron))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("exit", cmd_exit))
     app.add_handler(CommandHandler("ha", cmd_ha))
@@ -4349,7 +4667,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     logger.info("ClydeCodeBot live! Persistent sessions with OTP permission gate.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
