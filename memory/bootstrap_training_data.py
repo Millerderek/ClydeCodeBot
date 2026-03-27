@@ -72,11 +72,11 @@ def fetch_all_memories(limit=300):
 # Queries that SHOULD match specific memory types
 TARGETED_QUERIES = [
     # VPS/Infrastructure
-    ("what's the VPS IP address", ["vps", "contabo", "217.216", "server"]),
+    ("what's the VPS IP address", ["vps", "cloudprovider", "203.0", "server"]),
     ("what runs on the VPS", ["docker", "container", "vps", "server"]),
-    ("how is the VPS configured", ["docker", "contabo", "server", "compose"]),
+    ("how is the VPS configured", ["docker", "cloudprovider", "server", "compose"]),
     ("what's the Docker setup", ["docker", "compose", "container", "restart"]),
-    ("show me the infrastructure overview", ["vps", "docker", "server", "contabo"]),
+    ("show me the infrastructure overview", ["vps", "docker", "server", "cloudprovider"]),
 
     # Memory system
     ("how does the memory system work", ["mem0", "qdrant", "memory", "daemon"]),

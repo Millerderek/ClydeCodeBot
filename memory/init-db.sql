@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE TABLE IF NOT EXISTS memory_entities (
     id          SERIAL PRIMARY KEY,
     memory_id   UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    entity_name TEXT NOT NULL,                      -- e.g., 'Dometic', 'Teams', 'SBC'
+    entity_name TEXT NOT NULL,                      -- e.g., 'Acme Corp', 'Teams', 'SBC'
     entity_type TEXT NOT NULL DEFAULT 'general',    -- 'client', 'technology', 'person', 'project'
     UNIQUE(memory_id, entity_name)
 );

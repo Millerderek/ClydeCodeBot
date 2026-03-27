@@ -526,7 +526,7 @@ if __name__ == "__main__":
             "how do I parse JSON?",
             "what was the config?",
             "compare Docker Compose vs Kubernetes for this deployment",
-            "plan the migration from direct routing to operator connect for Dometic",
+            "plan the migration from direct routing to operator connect for Acme Corp",
             "restart nginx",
             ("I have a complex multi-step deployment involving three containers, "
              "a reverse proxy, TLS termination, and I need to figure out the "
@@ -542,15 +542,15 @@ if __name__ == "__main__":
     # Default: simulate gate with mock proposals
     gate = ConfidenceGate()
     proposals = [
-        ContextProposal("memo_search", "Derek uses VPS at 217.216.85.157 from Contabo",
+        ContextProposal("memo_search", "User runs VPS at 203.0.113.42 from CloudProvider",
                          confidence=0.72),
         ContextProposal("memo_search", "Docker container set to restart=always",
                          confidence=0.38),
-        ContextProposal("graph", "Entity: Contabo → hosts → VPS\nEntity: VPS → runs → Docker",
+        ContextProposal("graph", "Entity: CloudProvider → hosts → VPS\nEntity: VPS → runs → Docker",
                          confidence=0.55),
         ContextProposal("narrative", "Stale narrative from 45 days ago about old project",
                          confidence=0.25),
-        ContextProposal("peripheral", "[deadline] Bill due in 2 days: Contabo VPS",
+        ContextProposal("peripheral", "[deadline] Bill due in 2 days: CloudProvider VPS",
                          confidence=0.60),
         ContextProposal("patterns", "Pattern: Derek prefers Docker Compose over raw docker run",
                          confidence=0.48),
